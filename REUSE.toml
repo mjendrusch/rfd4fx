@@ -1,0 +1,38 @@
+version = 1
+
+# Default: the rfd4fx project is licensed Apache-2.0.
+[[annotations]]
+path = "**"
+precedence = "override"
+SPDX-FileCopyrightText = "2026 Michael A. Jendrusch"
+SPDX-License-Identifier = "Apache-2.0"
+
+# Parts ported from RFD4-Proteina (BSD-3-Clause, Institute for Protein
+# Design, University of Washington — see NOTICE and LICENSES/BSD-3-Clause.txt).
+# Per BSD-3-Clause, the upstream copyright notice and disclaimer are retained;
+# the JAX/Equinox port itself is distributed under Apache-2.0. Each file's
+# module docstring carries a prominent port/modification notice.
+[[annotations]]
+path = [
+    "src/rfd4fx/model.py",
+    "src/rfd4fx/flow_matching.py",
+    "src/rfd4fx/search.py",
+    "src/rfd4fx/spec.py",
+    "src/rfd4fx/featurize.py",
+    "src/rfd4fx/featurize_atoms.py",
+    "src/rfd4fx/types.py",
+    "src/rfd4fx/atom24.py",
+    "src/rfd4fx/pdb_io.py",
+    "src/rfd4fx/ligand_conditions.py",
+    "src/rfd4fx/nn/features.py",
+    "src/rfd4fx/nn/transformer.py",
+    "src/rfd4fx/nn/composites.py",
+    "src/rfd4fx/nn/layers.py",
+    "src/rfd4fx/nn/noise_alignment.py",
+    "src/rfd4fx/backend.py",
+    "src/rfd4fx/convert.py",
+]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 Institute for Protein Design, University of Washington (RFD4-Proteina, BSD-3-Clause)"
+SPDX-FileCopyrightText = "2026 Michael A. Jendrusch (JAX/Equinox port)"
+SPDX-License-Identifier = "Apache-2.0"

@@ -1,0 +1,97 @@
+rfd4fx — NOTICE and attribution
+===============================
+
+rfd4fx is a JAX/Equinox port (re-implementation for inference) of parts of
+RFD4-Proteina, a flow-matching model for biomolecular design developed by the
+Baker Lab at the Institute for Protein Design, University of Washington, and
+NVIDIA GenAIR.
+
+Upstream project
+----------------
+  Source:   https://github.com/RosettaCommons/RFD4-Proteina
+  Model:    https://huggingface.co/nvidia/RFD4-Proteina
+  License:  BSD 3-Clause ("BSD-3-Clause")
+  Copyright (c) 2026, Institute for Protein Design, University of Washington
+
+The original upstream license text is provided verbatim in
+LICENSES/BSD-3-Clause.txt. NOTE: the upstream is licensed BSD-3-Clause
+(not Apache 2.0); the BSD-3-Clause notice and disclaimer are retained here
+as its terms require.
+
+License of this project
+-----------------------
+Unless otherwise noted, the rfd4fx source is licensed Apache-2.0
+(see LICENSE and LICENSES/Apache-2.0.txt), Copyright (c) 2026
+Michael A. Jendrusch. Modified derived files carry prominent modification
+notices in their module docstrings; the upstream copyright notice and
+disclaimer are retained below and in LICENSES/BSD-3-Clause.txt.
+
+BSD 3-Clause notice and disclaimer (upstream, retained as required):
+
+    Redistribution and use in source and binary forms, with or without
+    modification, are permitted provided that the following conditions are
+    met: redistributions of source code must retain the above copyright
+    notice, this list of conditions and the following disclaimer;
+    redistributions in binary form must reproduce the above copyright
+    notice, this list of conditions and the following disclaimer in the
+    documentation and/or other materials provided with the distribution;
+    neither the name of the copyright holder nor the names of its
+    contributors may be used to endorse or promote products derived from
+    this software without specific prior written permission.
+
+    THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS
+    IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
+    TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
+    PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+    HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+    SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED
+    TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+    PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
+    LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+    NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+    SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+Derived components
+------------------
+The following modules of rfd4fx are ports (re-implementations in JAX/Equinox
+and numpy) of the corresponding RFD4-Proteina sources, preserving the native
+numerical semantics (validated by tests/module_parity/ against the native
+PyTorch implementation):
+
+  src/rfd4fx/model.py            <- rfproteina/proteina.py, rfproteina/generate.py
+  src/rfd4fx/flow_matching.py    <- rfproteina/flow_matching/rdn_flow_matcher.py,
+                                    rfproteina/flow_matching/product_space_flow_matcher.py
+  src/rfd4fx/search.py           <- rfproteina/search/beam_search.py
+  src/rfd4fx/spec.py             <- rfproteina annotated-CIF featurization pipeline
+                                    (rfproteina/conditions.py, rfproteina/datapipes/)
+  src/rfd4fx/featurize.py        <- native torch batch featurization
+  src/rfd4fx/featurize_atoms.py  <- native annotated-CIF real-atom featurization
+  src/rfd4fx/types.py            <- native batch schema (rfproteina batch containers)
+  src/rfd4fx/atom24.py           <- native structure export (rfproteina/utils/structure_export.py)
+  src/rfd4fx/pdb_io.py           <- native structure export (rfproteina/utils/structure_export.py)
+  src/rfd4fx/ligand_conditions.py <- native ligand interaction heuristics
+                                    (atomworks/ml/transforms/interactions.py, as used by RFD4-Proteina)
+  src/rfd4fx/nn/features.py      <- rfproteina/nn/feature_factory.py
+  src/rfd4fx/nn/transformer.py   <- rfproteina/nn/local_latents_transformer.py,
+                                    rfproteina/nn/modules/{pair_bias_attn, seq_transition_af3,
+                                    pair_update, pair_rep_initial, attn_n_transition}
+  src/rfd4fx/nn/composites.py    <- rfproteina/nn/modules/{adaptive_ln_scale, swiglu,
+                                    openfold_modules/*}
+  src/rfd4fx/nn/layers.py        <- rfproteina/nn/modules/norm.py, rfproteina/nn/modules/blocks.py
+  src/rfd4fx/nn/noise_alignment.py <- rfproteina/nn/noise_alignment.py
+  src/rfd4fx/backend.py          <- conversion glue for the native torch modules above
+  src/rfd4fx/convert.py          <- conversion glue for the native torch modules above
+
+Port-authored components (not derived from upstream source, but exposing
+semantics mirroring the native behavior):
+  src/rfd4fx/rfd4_input.py       (RFD4Input authoring API)
+  src/rfd4fx/ccd.py              (gemmi-backed CCD access)
+  src/rfd4fx/annotated_cif.py    (annotated-CIF entry glue)
+  scripts/, tests/               (design scripts and the parity test-suite)
+
+Dependencies
+------------
+rfd4fx depends on third-party packages (not distributed in this repository)
+with their own licenses — notably atomworks, gemmi, rdkit, biotite, networkx,
+jax/equinox and (optionally, for checkpoint conversion) torch and the native
+rfd4-proteina package. Their terms are provided by the respective packages.

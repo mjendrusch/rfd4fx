@@ -1,0 +1,67 @@
+[project]
+name = "rfd4fx"
+version = "0.1.0"
+description = "Flexcraft-compatible JAX/Equinox port of RFD4-Proteina (torch-free inference)"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+license = "Apache-2.0"
+license-files = ["LICENSE", "LICENSES/*"]
+authors = [{ name = "Michael A. Jendrusch", email = "michael.jendrusch@dkfz.de" }]
+dependencies = [
+    "jax>=0.12",
+    "equinox>=0.13",
+    "einops>=0.8",
+    "jaxtyping>=0.3",
+    "numpy>=1.26",
+    "atomworks>=3.0.4",
+    "gemmi>=0.6.5",
+    "rdkit>=2024.3.5",
+    "networkx",
+    "zstandard",
+    "rfd4-proteina>=0.0.3",
+]
+
+[project.optional-dependencies]
+# torch is required only for the one-time from_torch checkpoint conversion and
+# the native-parity test-suite; inference on converted weights is torch-free.
+# Under uv, torch ALWAYS resolves to the CPU-only wheels (see [tool.uv] below).
+convert = ["torch>=2.11"]
+test = ["pytest"]
+flexcraft = [
+    "flexcraft @ git+https://github.com/mjendrusch/flexcraft.git",
+]
+
+[project.urls]
+Homepage = "https://github.com/mjendrusch/rfd4fx"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/rfd4fx"]
+
+# ---------------------------------------------------------------------------
+# torch: CPU-only wheels, never CUDA.
+#
+# The explicit `pytorch-cpu` index serves only the packages listed in
+# [tool.uv.sources] (torch), so the CUDA-bundled wheels on PyPI can never be
+# selected in any uv resolution rooted at this project — including the
+# `convert` and `flexcraft` extras. For non-uv installs, install torch with
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+# ---------------------------------------------------------------------------
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+
+[tool.pytest.ini_options]
+# Module parity files are named after the module (user convention), not test_*.py.
+python_files = ["*.py"]
+testpaths = ["tests"]
+
+[tool.hatch.metadata]
+allow-direct-references = true
