@@ -14,14 +14,11 @@ from __future__ import annotations
 import argparse
 import pathlib
 
-REPO = pathlib.Path("/Users/mjendrusch/repos/rfd4j")
-SNAPSHOT = (REPO / ".hf_cache/hub/models--nvidia--RFD4-Proteina/snapshots/"
-            "a06e2509c7033b010fc43614e9fd840303588502")
-
+SNAPSHOT = "nvidia/RFD4-Proteina"
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpoint", type=pathlib.Path, default=SNAPSHOT)
+    parser.add_argument("--checkpoint", type=str, default=str(SNAPSHOT))
     parser.add_argument("--out", type=pathlib.Path,
                         default=pathlib.Path("~/.rfd4fx/models/rfd4_release"))
     args = parser.parse_args()
