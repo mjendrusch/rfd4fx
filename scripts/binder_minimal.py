@@ -23,8 +23,6 @@ from rfd4fx.flow_matching import RFD4Sampler, THINKING_HIGH
 from rfd4fx.model import RFD4
 from rfd4fx.rfd4_input import RFD4Input
 
-REPO = pathlib.Path(__file__).resolve().parents[1]
-
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -42,7 +40,7 @@ def main() -> None:
     parser.add_argument("--num_designs", type=int, default=5)
     parser.add_argument("--num_aa", type=int, default=80)
     parser.add_argument("--out_path", type=pathlib.Path,
-                        default=REPO / "rfd4-test-binder")
+                        default=pathlib.Path("runs/rfd4-test-binder"))
     args = parser.parse_args()
     args.out_path.mkdir(parents=True, exist_ok=True)
 

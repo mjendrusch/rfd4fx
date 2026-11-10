@@ -11,8 +11,6 @@ Gates:
 4. `to_dict` / `to_batch` round-trip every input key.
 """
 
-import pathlib
-
 import numpy as np
 import jax
 import jax.numpy as jnp
@@ -630,8 +628,7 @@ def _load_jax_model():
     from rfd4fx.model import RFD4
 
     model = Proteina.from_pretrained(
-        pathlib.Path("/Users/mjendrusch/repos/rfd4j/.hf_cache/hub/models--nvidia--"
-                     "RFD4-Proteina/snapshots/a06e2509c7033b010fc43614e9fd840303588502"))
+        SNAPSHOT, revision=REV, cache_dir=CACHE)
     model.eval()
     return RFD4.from_torch(model)
 
@@ -693,11 +690,10 @@ def _ae_inertness(jm, inp, inp_pad, n_real, n_pad):
     assert err < 5e-5, f"padding changed real-token decode (max {err})"
 
 
-_SNAPSHOT = pathlib.Path("/Users/mjendrusch/repos/rfd4j/.hf_cache/hub/models--nvidia--"
-                         "RFD4-Proteina/snapshots/a06e2509c7033b010fc43614e9fd840303588502")
+from conftest import CACHE, REV, SNAPSHOT, release_bundle_available  # noqa: E402
 
-_INERT = pytest.mark.skipif(not _SNAPSHOT.exists(),
-                            reason="release bundle not downloaded")
+_INERT = pytest.mark.skipif(not release_bundle_available(),
+                            reason="release bundle not in the local HF cache")
 
 
 @_INERT

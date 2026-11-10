@@ -17,8 +17,7 @@ import pathlib
 import numpy as np
 import pytest
 
-REPO = pathlib.Path("/Users/mjendrusch/repos/rfd4j")
-NATIVE = REPO / "test-featuresets/rfd4_native.npz"
+NATIVE = pathlib.Path("tests/fixtures/native/rfd4_native.npz")
 pytestmark = pytest.mark.skipif(not NATIVE.exists(), reason="native feature archive not present")
 
 import jax.numpy as jnp  # noqa: E402

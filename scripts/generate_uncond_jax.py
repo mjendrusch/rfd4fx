@@ -6,7 +6,7 @@ AE decode — and writes one validated PDB per design.
 
 Example:
     python scripts/generate_uncond_jax.py --n-residues 100 --num-designs 100 \
-        --batch-size 10 --out-dir /Users/mjendrusch/repos/rfd4j/rfd4-jax-testruns
+        --batch-size 10 --out-dir runs/rfd4-jax-testruns
 """
 
 from __future__ import annotations
@@ -19,9 +19,8 @@ import time
 
 import numpy as np
 
-SNAPSHOT = pathlib.Path(
-    "/Users/mjendrusch/repos/rfd4j/.hf_cache/hub/models--nvidia--RFD4-Proteina/snapshots/a06e2509c7033b010fc43614e9fd840303588502"
-)
+# Release weights, fetched from the Hugging Face hub on first use.
+SNAPSHOT = "nvidia/RFD4-Proteina"
 
 
 def main() -> None:
@@ -32,7 +31,10 @@ def main() -> None:
     parser.add_argument("--out-dir", type=pathlib.Path, required=True)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--nsteps", type=int, default=60)
-    parser.add_argument("--checkpoint", type=pathlib.Path, default=SNAPSHOT)
+    parser.add_argument("--checkpoint", type=str, default=SNAPSHOT)
+    parser.add_argument("--cache", type=pathlib.Path, default=None,
+                        help="HF cache dir for the release checkpoint "
+                             "(default: the huggingface default cache)")
     args = parser.parse_args()
 
     import jax

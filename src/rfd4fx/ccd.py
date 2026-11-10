@@ -12,8 +12,7 @@ import urllib.request
 
 import numpy as np
 
-REPO = pathlib.Path(__file__).resolve().parents[2]
-DEFAULT_CACHE_DIR = REPO / ".ccd_cache"
+DEFAULT_CACHE_DIR = pathlib.Path(".ccd_cache")
 CCD_DOWNLOAD_URL = "https://files.wwpdb.org/pub/pdb/data/monomers/components.cif.gz"
 
 _BOND_ORDER_MAP = {b"SING": 1, b"DOUB": 2, b"TRIP": 3}

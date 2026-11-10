@@ -10,7 +10,7 @@ their original names/IDs, chain B = the ligand HETATM) plus `motifs.json`
 
 Example:
     python scripts/extract_motifs.py \
-        --design-dir /Users/mjendrusch/repos/rfd4j/rfd4-test-ligands/random
+        --design-dir runs/rfd4-test-ligands/random
 """
 
 from __future__ import annotations
@@ -25,8 +25,7 @@ import numpy as np
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--design-dir", type=pathlib.Path,
-                        default=pathlib.Path("/Users/mjendrusch/repos/rfd4j"
-                                             "/rfd4-test-ligands/random"))
+                        default=pathlib.Path("runs/rfd4-test-ligands/random"))
     parser.add_argument("--num-residues", type=int, default=5)
     parser.add_argument("--cutoff", type=float, default=5.0)
     args = parser.parse_args()

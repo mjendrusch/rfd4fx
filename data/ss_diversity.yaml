@@ -1,0 +1,157 @@
+ss_bin_0_alpha0of8:
+  input: ../RFD4-Proteina/tests/data/1a1e.cif
+  contig: "A1-8, EX1:7, EX2:7, EX3:7, EX4:7, EX5:7, EX6:7, EX7:7, EX8:7"
+  conditions:
+    C_SEC:
+      SHEET:
+        - select: "sel('*/EX1')"
+        - select: "sel('*/EX2')"
+        - select: "sel('*/EX3')"
+        - select: "sel('*/EX4')"
+        - select: "sel('*/EX5')"
+        - select: "sel('*/EX6')"
+        - select: "sel('*/EX7')"
+        - select: "sel('*/EX8')"
+
+ss_bin_1_alpha1of8:
+  input: ../RFD4-Proteina/tests/data/1a1e.cif
+  contig: "A1-8, EX1:7, EX2:7, EX3:7, EX4:7, EX5:7, EX6:7, EX7:7, EX8:7"
+  conditions:
+    C_SEC:
+      HELIX:
+        - select: "sel('*/EX1')"
+      SHEET:
+        - select: "sel('*/EX2')"
+        - select: "sel('*/EX3')"
+        - select: "sel('*/EX4')"
+        - select: "sel('*/EX5')"
+        - select: "sel('*/EX6')"
+        - select: "sel('*/EX7')"
+        - select: "sel('*/EX8')"
+
+ss_bin_2_alpha2of8:
+  input: ../RFD4-Proteina/tests/data/1a1e.cif
+  contig: "A1-8, EX1:7, EX2:7, EX3:7, EX4:7, EX5:7, EX6:7, EX7:7, EX8:7"
+  conditions:
+    C_SEC:
+      HELIX:
+        - select: "sel('*/EX1')"
+        - select: "sel('*/EX5')"
+      SHEET:
+        - select: "sel('*/EX2')"
+        - select: "sel('*/EX3')"
+        - select: "sel('*/EX4')"
+        - select: "sel('*/EX6')"
+        - select: "sel('*/EX7')"
+        - select: "sel('*/EX8')"
+
+ss_bin_3_alpha3of8:
+  input: ../RFD4-Proteina/tests/data/1a1e.cif
+  contig: "A1-8, EX1:7, EX2:7, EX3:7, EX4:7, EX5:7, EX6:7, EX7:7, EX8:7"
+  conditions:
+    C_SEC:
+      HELIX:
+        - select: "sel('*/EX1')"
+        - select: "sel('*/EX4')"
+        - select: "sel('*/EX6')"
+      SHEET:
+        - select: "sel('*/EX2')"
+        - select: "sel('*/EX3')"
+        - select: "sel('*/EX5')"
+        - select: "sel('*/EX7')"
+        - select: "sel('*/EX8')"
+
+ss_bin_4_alpha4of8:
+  input: ../RFD4-Proteina/tests/data/1a1e.cif
+  contig: "A1-8, EX1:7, EX2:7, EX3:7, EX4:7, EX5:7, EX6:7, EX7:7, EX8:7"
+  conditions:
+    C_SEC:
+      HELIX:
+        - select: "sel('*/EX1')"
+        - select: "sel('*/EX3')"
+        - select: "sel('*/EX5')"
+        - select: "sel('*/EX7')"
+      SHEET:
+        - select: "sel('*/EX2')"
+        - select: "sel('*/EX4')"
+        - select: "sel('*/EX6')"
+        - select: "sel('*/EX8')"
+
+ss_bin_5_alpha4of8:
+  input: ../RFD4-Proteina/tests/data/1a1e.cif
+  contig: "A1-8, EX1:7, EX2:7, EX3:7, EX4:7, EX5:7, EX6:7, EX7:7, EX8:7"
+  conditions:
+    C_SEC:
+      HELIX:
+        - select: "sel('*/EX1')"
+        - select: "sel('*/EX3')"
+        - select: "sel('*/EX5')"
+        - select: "sel('*/EX7')"
+      SHEET:
+        - select: "sel('*/EX2')"
+        - select: "sel('*/EX4')"
+        - select: "sel('*/EX6')"
+        - select: "sel('*/EX8')"
+
+ss_bin_6_alpha5of8:
+  input: ../RFD4-Proteina/tests/data/1a1e.cif
+  contig: "A1-8, EX1:7, EX2:7, EX3:7, EX4:7, EX5:7, EX6:7, EX7:7, EX8:7"
+  conditions:
+    C_SEC:
+      HELIX:
+        - select: "sel('*/EX1')"
+        - select: "sel('*/EX3')"
+        - select: "sel('*/EX4')"
+        - select: "sel('*/EX6')"
+        - select: "sel('*/EX7')"
+      SHEET:
+        - select: "sel('*/EX2')"
+        - select: "sel('*/EX5')"
+        - select: "sel('*/EX8')"
+
+ss_bin_7_alpha6of8:
+  input: ../RFD4-Proteina/tests/data/1a1e.cif
+  contig: "A1-8, EX1:7, EX2:7, EX3:7, EX4:7, EX5:7, EX6:7, EX7:7, EX8:7"
+  conditions:
+    C_SEC:
+      HELIX:
+        - select: "sel('*/EX1')"
+        - select: "sel('*/EX2')"
+        - select: "sel('*/EX4')"
+        - select: "sel('*/EX5')"
+        - select: "sel('*/EX6')"
+        - select: "sel('*/EX8')"
+      SHEET:
+        - select: "sel('*/EX3')"
+        - select: "sel('*/EX7')"
+
+ss_bin_8_alpha7of8:
+  input: ../RFD4-Proteina/tests/data/1a1e.cif
+  contig: "A1-8, EX1:7, EX2:7, EX3:7, EX4:7, EX5:7, EX6:7, EX7:7, EX8:7"
+  conditions:
+    C_SEC:
+      HELIX:
+        - select: "sel('*/EX1')"
+        - select: "sel('*/EX2')"
+        - select: "sel('*/EX3')"
+        - select: "sel('*/EX4')"
+        - select: "sel('*/EX6')"
+        - select: "sel('*/EX7')"
+        - select: "sel('*/EX8')"
+      SHEET:
+        - select: "sel('*/EX5')"
+
+ss_bin_9_alpha8of8:
+  input: ../RFD4-Proteina/tests/data/1a1e.cif
+  contig: "A1-8, EX1:7, EX2:7, EX3:7, EX4:7, EX5:7, EX6:7, EX7:7, EX8:7"
+  conditions:
+    C_SEC:
+      HELIX:
+        - select: "sel('*/EX1')"
+        - select: "sel('*/EX2')"
+        - select: "sel('*/EX3')"
+        - select: "sel('*/EX4')"
+        - select: "sel('*/EX5')"
+        - select: "sel('*/EX6')"
+        - select: "sel('*/EX7')"
+        - select: "sel('*/EX8')"

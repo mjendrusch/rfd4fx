@@ -11,20 +11,15 @@ import jax
 import jax.numpy as jnp
 import biotite.structure as bst
 
-FIXTURES = pathlib.Path(__file__).resolve().parents[1] / "fixtures" / "torch_batches"
-pytestmark = pytest.mark.skipif(
-    not FIXTURES.exists(),
-    reason="torch batch fixtures not dumped",
-)
+FIXTURES = pathlib.Path("tests/fixtures/torch_batches")
+from conftest import CACHE, REV, SNAPSHOT, release_bundle_available  # noqa: E402
 
-import os  # noqa: E402
-
-SNAPSHOT = pathlib.Path(
-    os.environ.get(
-        "RFD4FX_BUNDLE",
-        "/Users/mjendrusch/repos/rfd4j/.hf_cache/hub/models--nvidia--RFD4-Proteina/snapshots/a06e2509c7033b010fc43614e9fd840303588502",
-    )
-)
+pytestmark = [
+    pytest.mark.skipif(not FIXTURES.exists(),
+                       reason="torch batch fixtures not dumped"),
+    pytest.mark.skipif(not release_bundle_available(),
+                       reason="release bundle not in the local HF cache"),
+]
 
 
 def _helix_fraction(coors_nm, emit_mask):
@@ -46,7 +41,7 @@ def _assemble(npz_name):
 def test_conditioned_generation_from_real_tensors(tmp_path):
     from rfd4_proteina import Proteina
 
-    model = Proteina.from_pretrained(SNAPSHOT)
+    model = Proteina.from_pretrained(SNAPSHOT, revision=REV, cache_dir=CACHE)
     model.eval()
     from rfd4fx.model import RFD4
 

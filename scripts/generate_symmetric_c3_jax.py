@@ -24,9 +24,8 @@ import time
 
 import numpy as np
 
-REPO = pathlib.Path("/Users/mjendrusch/repos/rfd4j")
-SNAPSHOT = (REPO / ".hf_cache/hub/models--nvidia--RFD4-Proteina/snapshots/"
-            "a06e2509c7033b010fc43614e9fd840303588502")
+# Release weights, fetched from the Hugging Face hub on first use.
+SNAPSHOT = "nvidia/RFD4-Proteina"
 CAFFEINE = "Cn1c(=O)c2c(ncn2C)n(C)c1=O"
 
 
@@ -39,7 +38,10 @@ def main() -> None:
     parser.add_argument("--nsteps", type=int, default=60)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--out-dir", type=pathlib.Path,
-                        default=REPO / "rfd4-test-symmetry")
+                        default=pathlib.Path("runs/rfd4-test-symmetry"))
+    parser.add_argument("--cache", type=pathlib.Path, default=None,
+                        help="HF cache dir for the release checkpoint "
+                             "(default: the huggingface default cache)")
     args = parser.parse_args()
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -98,7 +100,7 @@ def main() -> None:
 
     # ---------------------------------------------------------------- model
     print("loading + converting release weights ...", flush=True)
-    model = Proteina.from_pretrained(SNAPSHOT)
+    model = Proteina.from_pretrained(SNAPSHOT, cache_dir=args.cache)
     model.eval()
     import rfd4fx.convert  # noqa: F401
     from rfd4fx.model import RFD4

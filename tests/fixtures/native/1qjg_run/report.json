@@ -1,0 +1,24 @@
+{
+ "input": "RFD4-Proteina/data/benchmarks/motif_scaffolding/motif_unindexed/1QJG_AA_NATIVE.cif.zst",
+ "pipeline": "native build_design_validation_pipeline + native torch model, release sampler args + recycle schedule, CPU, torch seed 0",
+ "tokens": {
+  "real": 116,
+  "designed_stubs": 113,
+  "motif_tokens": [
+   113,
+   114,
+   115
+  ]
+ },
+ "motif_embedding": {
+  "min_stubCA_to_motifCA_A": 0.046837203204631805,
+  "stubCAs_within_10A": 54,
+  "centroid_distance_A": 4.5442891120910645
+ },
+ "files": {
+  "design_pdb": "native_1qjg_design.pdb",
+  "flow_state": "raw_outputs.npz",
+  "decoded": "formatted.npz",
+  "note": "chain A = designed stubs (UNK, decoded all-atom, flow frame); chain M = motif residues at their input coordinates (the flow frame is conditioned-centroid-at-origin)"
+ }
+}

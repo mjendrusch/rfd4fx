@@ -36,7 +36,7 @@ def main() -> None:
     model = Proteina.from_pretrained(bundle)
     model.eval()
 
-    summary: dict = {"bundle": str(bundle)}
+    summary: dict = {"bundle": f"huggingface:nvidia/RFD4-Proteina@{REV}"}
 
     # --- state_dict key tree ---
     sd = model.state_dict()
@@ -80,7 +80,7 @@ def main() -> None:
         "has_insertion_head": hasattr(nn, "insertion_q_proj"),
     }
 
-    out = Path(__file__).resolve().parents[1] / "tests" / "fixtures"
+    out = Path("tests/fixtures")
     out.mkdir(parents=True, exist_ok=True)
     (out / "bundle_summary.json").write_text(json.dumps(summary, indent=2))
     print(json.dumps({k: v for k, v in summary.items() if k != "state_keys"}, indent=2))

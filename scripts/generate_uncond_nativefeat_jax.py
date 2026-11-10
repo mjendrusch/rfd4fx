@@ -16,7 +16,7 @@ the ported `make_unconditioned_batch`), this script:
 
 Example:
     python scripts/generate_uncond_nativefeat_jax.py --n-residues 50 \
-        --num-designs 5 --out-dir /Users/mjendrusch/repos/rfd4j/test-featuresets
+        --num-designs 5 --out-dir runs/test-featuresets
 """
 
 from __future__ import annotations
@@ -29,8 +29,8 @@ import time
 
 import numpy as np
 
-REPO = pathlib.Path("/Users/mjendrusch/repos/rfd4j")
-SNAPSHOT = REPO / ".hf_cache/hub/models--nvidia--RFD4-Proteina/snapshots/a06e2509c7033b010fc43614e9fd840303588502"
+# Release weights, fetched from the Hugging Face hub on first use.
+SNAPSHOT = "nvidia/RFD4-Proteina"
 
 # Sentinel CIF template (the exact pattern of the torch uncond-64 reference run,
 # expanded to the requested chain length by string substitution).
@@ -119,7 +119,6 @@ _chem_comp_atom.pdbx_model_Cartn_z_ideal   nan
 
 def native_torch_features(n_residues: int) -> dict[str, np.ndarray]:
     """Run the REAL torch inference featurization on the de-novo sentinel CIF."""
-    sys.path.insert(0, str(REPO / "RFD4-Proteina/src"))
     import torch
     from rfproteina.datapipes.collate import collate_batch
     from rfproteina.datapipes.pipeline import build_design_validation_pipeline
@@ -153,7 +152,6 @@ def native_torch_features(n_residues: int) -> dict[str, np.ndarray]:
 def ported_features(n_residues: int) -> dict[str, np.ndarray]:
     """The same feature set from the PORTED pipeline (make_unconditioned_batch),
     expressed under torch-style keys so the archives align key-for-key."""
-    sys.path.insert(0, str(REPO / "rfd4fx/src"))
     from rfd4fx.featurize import (
         SEQ_PROB_ORDER,
         _KEY_TO_FIELD,
@@ -240,10 +238,13 @@ def main() -> None:
     parser.add_argument("--n-residues", type=int, default=50)
     parser.add_argument("--num-designs", type=int, default=5)
     parser.add_argument("--batch-size", type=int, default=5)
-    parser.add_argument("--out-dir", type=pathlib.Path, default=REPO / "test-featuresets")
+    parser.add_argument("--out-dir", type=pathlib.Path, default=pathlib.Path("runs/test-featuresets"))
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--nsteps", type=int, default=60)
-    parser.add_argument("--checkpoint", type=pathlib.Path, default=SNAPSHOT)
+    parser.add_argument("--checkpoint", type=str, default=SNAPSHOT)
+    parser.add_argument("--cache", type=pathlib.Path, default=None,
+                        help="HF cache dir for the release checkpoint "
+                             "(default: the huggingface default cache)")
     parser.add_argument("--skip-generation", action="store_true")
     args = parser.parse_args()
 
@@ -289,7 +290,7 @@ def main() -> None:
 
     torch.manual_seed(args.seed)
     print("      loading + converting release weights ...", flush=True)
-    model = Proteina.from_pretrained(args.checkpoint)
+    model = Proteina.from_pretrained(args.checkpoint, cache_dir=args.cache)
     model.eval()
     jax_model = RFD4.from_torch(model)
 

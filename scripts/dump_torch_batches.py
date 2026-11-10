@@ -11,14 +11,12 @@ host-side (numpy) by design.
 from __future__ import annotations
 
 import pathlib
-import sys
 
 import numpy as np
 import torch
 
-REPO = pathlib.Path("/Users/mjendrusch/repos/rfd4j/RFD4-Proteina")
-sys.path.insert(0, str(REPO / "src"))
-OUT = pathlib.Path("/Users/mjendrusch/repos/rfd4j/rfd4fx/tests/fixtures/torch_batches")
+OUT = pathlib.Path("tests/fixtures/torch_batches")
+DATA = pathlib.Path("data/ss_diversity.yaml")
 
 
 def main() -> None:
@@ -28,7 +26,7 @@ def main() -> None:
 
     pipeline = build_design_validation_pipeline()
     dataset = ConditionSpecDataset(
-        data="/Users/mjendrusch/repos/rfd4j/rfd4-torch-testruns/ss_diversity.yaml",
+        data=str(DATA),
         transform=pipeline,
         name="ss_diversity",
         num_replicates=1,

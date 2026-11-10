@@ -16,9 +16,10 @@ import pytest
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 
 CAFFEINE = "Cn1c(=O)c2c(ncn2C)n(C)c1=O"
-SNAPSHOT = ("/Users/mjendrusch/repos/rfd4j/.hf_cache/hub/"
-            "models--nvidia--RFD4-Proteina/snapshots/"
-            "a06e2509c7033b010fc43614e9fd840303588502")
+from conftest import CACHE, REV, SNAPSHOT, release_bundle_available  # noqa: E402
+
+pytestmark = pytest.mark.skipif(not release_bundle_available(),
+                                reason="release bundle not in the local HF cache")
 
 
 def _n_emit(dec) -> int:
@@ -62,7 +63,7 @@ def searcher():
     from rfd4fx.model import RFD4
     from rfd4fx.search import RFD4Search
 
-    model = Proteina.from_pretrained(SNAPSHOT)
+    model = Proteina.from_pretrained(SNAPSHOT, revision=REV, cache_dir=CACHE)
     model.eval()
     jax_model = RFD4.from_torch(model)
     step = RFD4Sampler(jax_model.step(), jax_model).step
