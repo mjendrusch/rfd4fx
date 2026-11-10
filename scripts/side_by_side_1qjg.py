@@ -21,11 +21,12 @@ from functools import partial
 
 import numpy as np
 
-REPO = pathlib.Path("/Users/mjendrusch/repos/rfd4j")
-sys.path.insert(0, str(REPO / "rfd4fx/scripts"))
-sys.path.insert(0, str(REPO / "rfd4fx/src"))
+REPO_ROOT = pathlib.Path("tests/fixtures/native/1qjg_run")
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
-OUT = REPO / "rfd4-test-native/1qjg_run/side_by_side"
+from rfd4_upstream import ensure_benchmarks
+
+OUT = REPO_ROOT / "side_by_side"
 OUT.mkdir(parents=True, exist_ok=True)
 
 # ---------------------------------------------------------------- native batch
@@ -34,10 +35,11 @@ from rfproteina.inference_utils.datasets import DesignProblemDataset
 from rfproteina.datapipes.collate import collate_batch
 from torch.utils.data import DataLoader
 
-z = np.load(REPO / "rfd4-test-native/1qjg_run/raw_outputs.npz")
+z = np.load(pathlib.Path("tests/fixtures/native/1qjg_run/raw_outputs.npz"))
 WANT_N = z["padding_mask"].shape[0]
 WANT_CCM = z["coord_cond_mask"]
-p = REPO / "RFD4-Proteina/data/benchmarks/motif_scaffolding/motif_unindexed/1QJG_AA_NATIVE.cif.zst"
+p = (ensure_benchmarks()
+     / "motif_scaffolding/motif_unindexed/1QJG_AA_NATIVE.cif.zst")
 
 batch = None
 for seed in range(500):
@@ -81,8 +83,7 @@ from rfd4fx.model import RFD4
 import biotite.structure as bs
 import biotite.structure.io.pdb as pdbio
 
-SNAP = (REPO / ".hf_cache/hub/models--nvidia--RFD4-Proteina/snapshots/"
-        "a06e2509c7033b010fc43614e9fd840303588502")
+SNAP = "nvidia/RFD4-Proteina"
 model = Proteina.from_pretrained(SNAP)
 model.eval()
 jax_model = RFD4.from_torch(model)
@@ -193,6 +194,6 @@ for tag, chain in (("port_separate_chain", "new"), ("port_joined_chain", None)):
     print(tag, json.dumps(reports[tag], indent=1), flush=True)
 
 reports["native_torch_reference"] = json.loads(
-    (REPO / "rfd4-test-native/1qjg_run/report.json").read_text())["motif_embedding"]
+    pathlib.Path("tests/fixtures/native/1qjg_run/report.json").read_text())["motif_embedding"]
 (OUT / "side_by_side_report.json").write_text(json.dumps(reports, indent=1))
 print("done ->", OUT, flush=True)

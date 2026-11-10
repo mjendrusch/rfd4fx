@@ -22,8 +22,11 @@ import sys
 
 import numpy as np
 
-REPO = pathlib.Path("/Users/mjendrusch/repos/rfd4j")
-BENCH = REPO / "RFD4-Proteina/data/benchmarks"
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+
+from rfd4_upstream import ensure_benchmarks, ensure_upstream_tests_data
+
+BENCH = ensure_benchmarks()
 
 DEFAULT_FILES = [
     BENCH / "monomer/monomer-short.cif.zst",                       # de-novo expseg
@@ -40,14 +43,11 @@ DEFAULT_FILES = [
 def all_example_cifs() -> list[pathlib.Path]:
     """Every example annotated CIF in the RFD4 repository (benchmarks + tests/data)."""
     files: list[pathlib.Path] = []
-    base = REPO / "RFD4-Proteina/data/benchmarks"
+    base = BENCH
     for pat in ("*.cif.zst", "*.cif.gz", "*.cif"):
         files.extend(sorted(base.rglob(pat)))
-    files.extend(sorted((REPO / "RFD4-Proteina/tests/data").glob("*.cif")))
+    files.extend(sorted(ensure_upstream_tests_data().glob("*.cif")))
     return files
-
-sys.path.insert(0, str(REPO / "rfd4fx/src"))
-sys.path.insert(0, str(REPO / "RFD4-Proteina/src"))
 
 KEY_FIELD = {
     "atom37_mask": "atom37_mask", "condition_coordinate_1_atom": "cond_coords",

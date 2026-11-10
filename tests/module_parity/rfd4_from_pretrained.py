@@ -13,9 +13,10 @@ import shutil
 import numpy as np
 import pytest
 
-SNAPSHOT = ("/Users/mjendrusch/repos/rfd4j/.hf_cache/hub/"
-            "models--nvidia--RFD4-Proteina/snapshots/"
-            "a06e2509c7033b010fc43614e9fd840303588502")
+from conftest import CACHE, REV, SNAPSHOT, release_bundle_available  # noqa: E402
+
+pytestmark = pytest.mark.skipif(not release_bundle_available(),
+                                reason="release bundle not in the local HF cache")
 
 
 def _tree_paths(module):
@@ -120,7 +121,7 @@ def test_from_pretrained_matches_torch_conversion():
     import rfd4fx.convert  # noqa: F401
     from rfd4fx.model import RFD4
 
-    model = Proteina.from_pretrained(SNAPSHOT)
+    model = Proteina.from_pretrained(SNAPSHOT, revision=REV, cache_dir=CACHE)
     model.eval()
     m_torch = RFD4.from_torch(model)
     m_jax = RFD4.from_pretrained(path="rfd4_release")

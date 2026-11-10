@@ -1,0 +1,19 @@
+Environment variable CCD_MIRROR_PATH not set. Will not be able to use function requiring this variable. To set it you may:
+  (1) add the line 'export VAR_NAME=path/to/variable' to your .bashrc or .zshrc file
+  (2) set it in your current shell with 'export VAR_NAME=path/to/variable'
+  (3) write it to a .env file in the root of the atomworks.io repository
+Environment variable PDB_MIRROR_PATH not set. Will not be able to use function requiring this variable. To set it you may:
+  (1) add the line 'export VAR_NAME=path/to/variable' to your .bashrc or .zshrc file
+  (2) set it in your current shell with 'export VAR_NAME=path/to/variable'
+  (3) write it to a .env file in the root of the atomworks.io repository
+native realization reproduced with seed 115: n=116
+stubs 113 | motif tokens [113, 114, 115] residue types [19, 3, 4]
+W1025 12:35:00.563000 1097 torch/distributed/elastic/multiprocessing/redirects.py:35] NOTE: Redirects are currently not supported in MacOs.
+cuEquivariance is unavailable; using torch. Reason: cuequivariance-ops-torch>=0.13 is required (No module named 'cuequivariance_ops_torch')
+Traceback (most recent call last):
+  File "/Users/mjendrusch/repos/rfd4j/jrfproteina/scripts/side_by_side_1qjg.py", line 171, in <module>
+    write_pdb(coors_nm, aatype, real_mask, coords_in[motif_tok], out_pdb)
+  File "/Users/mjendrusch/repos/rfd4j/jrfproteina/scripts/side_by_side_1qjg.py", line 133, in write_pdb
+    slot_names = enc.token_atoms.get(res_name) or [f"A{s}" for s in range(37)]
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+ValueError: The truth value of an array with more than one element is ambiguous. Use a.any() or a.all()

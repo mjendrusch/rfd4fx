@@ -18,14 +18,15 @@ dependencies = [
     "rdkit>=2024.3.5",
     "networkx",
     "zstandard",
-    "rfd4-proteina>=0.0.3",
 ]
 
 [project.optional-dependencies]
-# torch is required only for the one-time from_torch checkpoint conversion and
-# the native-parity test-suite; inference on converted weights is torch-free.
-# Under uv, torch ALWAYS resolves to the CPU-only wheels (see [tool.uv] below).
-convert = ["torch>=2.11"]
+# The native stack (torch + RFD4-Proteina) is required only for the one-time
+# from_torch checkpoint conversion and the native-parity test-suite; inference
+# on converted weights is torch-free. Under uv, torch ALWAYS resolves to the
+# CPU-only wheels (see [tool.uv] below).
+native = ["torch>=2.11", "rfd4-proteina>=0.0.3"]
+convert = ["rfd4fx[native]"]
 test = ["pytest"]
 flexcraft = [
     "flexcraft @ git+https://github.com/mjendrusch/flexcraft.git",

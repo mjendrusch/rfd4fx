@@ -6,7 +6,6 @@ end-to-end check; trajectory-level equality with the torch sampler is not
 expected (RNG streams differ — documented esmjfold2 convention).
 """
 
-import os
 import pathlib
 import sys
 
@@ -16,16 +15,17 @@ import jax
 import jax.numpy as jnp
 import equinox as eqx
 
-SNAPSHOT = pathlib.Path(
-    os.environ.get(
-        "RFD4FX_BUNDLE",
-        "/Users/mjendrusch/repos/rfd4j/.hf_cache/hub/models--nvidia--RFD4-Proteina/snapshots/a06e2509c7033b010fc43614e9fd840303588502",
-    )
-)
-pytestmark = pytest.mark.skipif(not SNAPSHOT.exists(), reason="release bundle not downloaded")
-
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
-from conftest import build_feature_batch  # noqa: E402
+from conftest import (  # noqa: E402
+    CACHE,
+    REV,
+    SNAPSHOT,
+    build_feature_batch,
+    release_bundle_available,
+)
+
+pytestmark = pytest.mark.skipif(not release_bundle_available(),
+                                reason="release bundle not in the local HF cache")
 
 
 def _uncond_batch(n=64, b=1):
@@ -107,7 +107,7 @@ def _uncond_batch(n=64, b=1):
 def test_end_to_end_sampling(tmp_path):
     from rfd4_proteina import Proteina
 
-    model = Proteina.from_pretrained(SNAPSHOT)
+    model = Proteina.from_pretrained(SNAPSHOT, revision=REV, cache_dir=CACHE)
     model.eval()
 
     from rfd4fx.model import RFD4, save_model, load_model

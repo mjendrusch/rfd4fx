@@ -9,20 +9,58 @@ never relaxed: max < 5e-5.
 
 from __future__ import annotations
 
+import os
+import pathlib
+
 import numpy as np
-import torch
 import jax
 import jax.numpy as jnp
 import equinox as eqx
 
+try:
+    import torch
+except ImportError:  # native extra not installed — the parity suite is skipped
+    torch = None
+
 from rfd4fx.backend import from_torch, register_base_types
 from rfd4fx.nn import composites, features, layers, transformer
 
-register_base_types()
-layers.register()
-composites.register()
-features.register()
-transformer.register()
+if torch is not None:
+    register_base_types()
+    layers.register()
+    composites.register()
+    features.register()
+    transformer.register()
+else:
+    collect_ignore_glob = ["*"]
+
+# --- release checkpoint ------------------------------------------------------
+# Loaded from the Hugging Face hub (pinned revision) on first use. Point
+# RFD4FX_BUNDLE at a local bundle directory, or RFD4FX_HF_CACHE at a cache
+# directory, to override.
+SNAPSHOT = os.environ.get("RFD4FX_BUNDLE", "nvidia/RFD4-Proteina")
+REV = "a06e2509c7033b010fc43614e9fd840303588502"
+CACHE = os.environ.get("RFD4FX_HF_CACHE") or None
+
+
+def release_bundle_available() -> bool:
+    """True when the release checkpoint is loadable (local dir or HF cache)."""
+    if pathlib.Path(SNAPSHOT).expanduser().is_dir():
+        return True
+    try:
+        from huggingface_hub import snapshot_download
+
+        snapshot_download(
+            SNAPSHOT,
+            revision=REV,
+            allow_patterns=["config.json", "model.safetensors"],
+            cache_dir=CACHE,
+            local_files_only=True,
+        )
+        return True
+    except Exception:
+        return False
+
 
 MAX_ABS_GATE = 5e-5
 N_TRIALS = 100

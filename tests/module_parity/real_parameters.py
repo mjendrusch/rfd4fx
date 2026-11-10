@@ -10,7 +10,6 @@ and the relabeling is a train-time augmentation whose JAX port is verified
 structurally in chirality_coord_group.py.
 """
 
-import os
 import pathlib
 
 import numpy as np
@@ -20,20 +19,16 @@ import jax.numpy as jnp
 import equinox as eqx
 import torch
 
-SNAPSHOT = pathlib.Path(
-    os.environ.get(
-        "RFD4FX_BUNDLE",
-        "/Users/mjendrusch/repos/rfd4j/.hf_cache/hub/models--nvidia--RFD4-Proteina/snapshots/a06e2509c7033b010fc43614e9fd840303588502",
-    )
-)
+from conftest import CACHE, REV, SNAPSHOT, release_bundle_available  # noqa: E402
 
-pytestmark = pytest.mark.skipif(not SNAPSHOT.exists(), reason="release bundle not downloaded")
+pytestmark = pytest.mark.skipif(not release_bundle_available(),
+                                reason="release bundle not in the local HF cache")
 
 
 def _load_real():
     from rfd4_proteina import Proteina
 
-    model = Proteina.from_pretrained(SNAPSHOT)
+    model = Proteina.from_pretrained(SNAPSHOT, revision=REV, cache_dir=CACHE)
     model.eval()
     return model
 

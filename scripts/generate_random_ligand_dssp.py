@@ -18,7 +18,7 @@ For each of `--num-pairs` trials:
 
 Example:
     python scripts/generate_random_ligand_dssp.py --num-pairs 100 \
-        --out-dir /Users/mjendrusch/repos/rfd4j/rfd4-test-ligands/random
+        --out-dir runs/rfd4-test-ligands/random
 """
 
 from __future__ import annotations
@@ -33,8 +33,8 @@ import urllib.request
 
 import numpy as np
 
-REPO = pathlib.Path("/Users/mjendrusch/repos/rfd4j")
-SNAPSHOT = REPO / ".hf_cache/hub/models--nvidia--RFD4-Proteina/snapshots/a06e2509c7033b010fc43614e9fd840303588502"
+# Release weights, fetched from the Hugging Face hub on first use.
+SNAPSHOT = "nvidia/RFD4-Proteina"
 CHEMBL_BASE = "https://www.ebi.ac.uk/chembl/api/data/molecule.json"
 
 
@@ -184,9 +184,12 @@ def main() -> None:
                         help="salad random_dssp's per-element '_' probability")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--nsteps", type=int, default=60)
-    parser.add_argument("--checkpoint", type=pathlib.Path, default=SNAPSHOT)
+    parser.add_argument("--checkpoint", type=str, default=SNAPSHOT)
+    parser.add_argument("--cache", type=pathlib.Path, default=None,
+                        help="HF cache dir for the release checkpoint "
+                             "(default: the huggingface default cache)")
     parser.add_argument("--out-dir", type=pathlib.Path,
-                        default=REPO / "rfd4-test-ligands/random")
+                        default=pathlib.Path("runs/rfd4-test-ligands/random"))
     args = parser.parse_args()
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -210,7 +213,7 @@ def main() -> None:
 
     torch.manual_seed(args.seed)
     print("loading + converting release weights ...", flush=True)
-    model = Proteina.from_pretrained(args.checkpoint)
+    model = Proteina.from_pretrained(args.checkpoint, cache_dir=args.cache)
     model.eval()
     jax_model = RFD4.from_torch(model)
     enc = UNIFIED_ATOM37_ENCODING

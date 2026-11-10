@@ -679,14 +679,14 @@ _CATH_MAPPING_CACHE: dict | None = None
 def _load_cath_mapping() -> dict:
     """The pipeline's CATH label → dense-id mapping (data/cath_label_mapping.pkl).
 
-    Looked up relative to the rfproteina package (the pinned reference repo);
+    Looked up relative to the current working directory (run from the repo root);
     ``RFD4FX_CATH_MAPPING`` overrides the path. Cached per process.
     """
     global _CATH_MAPPING_CACHE
     if _CATH_MAPPING_CACHE is None:
         import os
         import pickle
-        default = pathlib.Path(__file__).resolve().parents[3] / "RFD4-Proteina" / "data" / "cath_label_mapping.pkl"
+        default = pathlib.Path("data") / "cath_label_mapping.pkl"
         path = pathlib.Path(os.environ.get("RFD4FX_CATH_MAPPING", default))
         with open(path, "rb") as f:
             _CATH_MAPPING_CACHE = pickle.load(f)

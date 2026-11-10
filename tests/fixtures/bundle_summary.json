@@ -1,5 +1,5 @@
 {
-  "bundle": "/Users/mjendrusch/.cache/huggingface/hub/models--nvidia--RFD4-Proteina/snapshots/a06e2509c7033b010fc43614e9fd840303588502",
+  "bundle": "huggingface:nvidia/RFD4-Proteina@a06e2509c7033b010fc43614e9fd840303588502",
   "n_state_tensors": 1257,
   "state_keys": {
     "autoencoder.encoder.init_repr_factory.feat_creators.0.embedding.weight": [

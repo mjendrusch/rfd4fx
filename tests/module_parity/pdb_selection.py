@@ -4,10 +4,13 @@ B=1 'LIG' HETATM)."""
 
 from __future__ import annotations
 
+import pathlib
+
 import numpy as np
 import pytest
 
-PDB = "../rfd4-test-ligands/motif_theozyme/design_000_scaffold_00.pdb"
+FIXTURES = pathlib.Path("tests/fixtures/pdb")
+PDB = str(FIXTURES / "design_000_scaffold_00.pdb")
 
 
 def _n_real(inp) -> int:
@@ -268,7 +271,7 @@ class TestStrHotspot:
 
 # ------------------------------------- partially-indexed motifs (MS16)
 
-BINDER = "../rfd4-test-pdl1/binder_01.pdb"
+BINDER = str(FIXTURES / "binder_01.pdb")
 BACKBONE_ATOMS = ("N", "CA", "C", "O", "OXT")
 _BACKBONE_SLOTS = {"N": 0, "CA": 1, "C": 2, "O": 4, "OXT": 36}
 

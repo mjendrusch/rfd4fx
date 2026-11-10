@@ -1,0 +1,19 @@
+Environment variable CCD_MIRROR_PATH not set. Will not be able to use function requiring this variable. To set it you may:
+  (1) add the line 'export VAR_NAME=path/to/variable' to your .bashrc or .zshrc file
+  (2) set it in your current shell with 'export VAR_NAME=path/to/variable'
+  (3) write it to a .env file in the root of the atomworks.io repository
+Environment variable PDB_MIRROR_PATH not set. Will not be able to use function requiring this variable. To set it you may:
+  (1) add the line 'export VAR_NAME=path/to/variable' to your .bashrc or .zshrc file
+  (2) set it in your current shell with 'export VAR_NAME=path/to/variable'
+  (3) write it to a .env file in the root of the atomworks.io repository
+W1025 11:34:08.121000 97801 torch/distributed/elastic/multiprocessing/redirects.py:35] NOTE: Redirects are currently not supported in MacOs.
+cuEquivariance is unavailable; using torch. Reason: cuequivariance-ops-torch>=0.13 is required (No module named 'cuequivariance_ops_torch')
+flow state saved; real tokens: 116 | motif tokens: [113, 114, 115]
+Traceback (most recent call last):
+  File "<stdin>", line 59, in <module>
+  File "/Users/mjendrusch/repos/rfd4j/RFD4-Proteina/src/rfproteina/proteina.py", line 1979, in sample_formatting
+    return self._format_sample_local_latents(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/mjendrusch/repos/rfd4j/RFD4-Proteina/src/rfproteina/proteina.py", line 2048, in _format_sample_local_latents
+    raise ValueError(
+ValueError: condition_decoder_on_sequence_prediction is enabled, but the checkpoint has no sequence readout output.

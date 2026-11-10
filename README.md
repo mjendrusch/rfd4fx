@@ -27,7 +27,7 @@ uv pip install -e .
 Optional extras:
 
 ```bash
-uv pip install -e ".[convert]"     # torch for one-time checkpoint conversion (CPU wheels only)
+uv pip install -e ".[native]"      # torch + RFD4-Proteina: conversion + native parity (CPU wheels only)
 uv pip install -e ".[test]"        # pytest for the parity suite
 uv pip install -e ".[flexcraft]"   # flexcraft co-installation
 ```
@@ -42,12 +42,12 @@ uv pip install -e ".[flexcraft]"   # flexcraft co-installation
 
 ### Checkpoint
 
-Convert the native RFD4-Proteina checkpoint once (requires `.[convert]` and a
-local checkout of the native repository):
+Convert the native RFD4-Proteina checkpoint once (requires `.[native]`; the
+release bundle is fetched from the Hugging Face hub on first use, or point
+`--checkpoint` at a local bundle directory and `--cache` at an HF cache dir):
 
 ```bash
 python scripts/translate_rfd4.py \
-    --checkpoint ~/.cache/huggingface/hub/models--nvidia--RFD4-Proteina/snapshots/<hash> \
     --out ~/.rfd4fx/models/rfd4_release
 ```
 
@@ -119,13 +119,17 @@ result.save_pdb("design.pdb")
 
 ## Testing
 
+Run from the repository root — the parity tests and scripts resolve data and
+output paths relative to the current working directory:
+
 ```bash
-uv pip install -e ".[convert,test]"
+uv pip install -e ".[native,test]"
 pytest tests/module_parity/ -q
 ```
 
 The parity suite compares every module against the native torch implementation
-(205 tests); inference itself is torch-free.
+(205 tests); tests that need the release checkpoint skip when it is not in the
+local Hugging Face cache. Inference itself is torch-free.
 
 ## License
 

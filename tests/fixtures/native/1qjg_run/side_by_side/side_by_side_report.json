@@ -1,0 +1,27 @@
+{
+ "port_separate_chain": {
+  "min_stubCA_to_motifCA_A": 4.874881267547607,
+  "stubCAs_within_10A": 17,
+  "centroid_distance_A": 17.01731300354004,
+  "motif_match_rmsd_A": 1.3023069581469455,
+  "motif_match_atoms": 16,
+  "motif_residues_placed": 3,
+  "motif_matched": true,
+  "seconds": 136
+ },
+ "port_joined_chain": {
+  "min_stubCA_to_motifCA_A": 0.08379902690649033,
+  "stubCAs_within_10A": 36,
+  "centroid_distance_A": 10.059600830078125,
+  "motif_match_rmsd_A": 0.1341976144577034,
+  "motif_match_atoms": 28,
+  "motif_residues_placed": 3,
+  "motif_matched": true,
+  "seconds": 141
+ },
+ "native_torch_reference": {
+  "min_stubCA_to_motifCA_A": 0.046837203204631805,
+  "stubCAs_within_10A": 54,
+  "centroid_distance_A": 4.5442891120910645
+ }
+}

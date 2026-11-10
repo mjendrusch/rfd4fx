@@ -5,14 +5,10 @@ keys: same trunk call (module as a traced eqx arg), same key discipline, same
 integration. Runs on the release weights (same env as end_to_end_sampling).
 """
 
-import pathlib
-
 import numpy as np
 import pytest
 
-REPO = pathlib.Path("/Users/mjendrusch/repos/rfd4j")
-SNAPSHOT = (REPO / ".hf_cache/hub/models--nvidia--RFD4-Proteina/snapshots/"
-            "a06e2509c7033b010fc43614e9fd840303588502")
+from conftest import CACHE, REV, SNAPSHOT, release_bundle_available
 
 
 def _close(a, b, atol=1e-6):
@@ -23,7 +19,7 @@ def _close(a, b, atol=1e-6):
 
 
 def test_sampler_matches_full_simulation(tmp_path):
-    if not SNAPSHOT.exists():
+    if not release_bundle_available():
         pytest.skip("release snapshot not present")
 
     import jax
@@ -37,7 +33,7 @@ def test_sampler_matches_full_simulation(tmp_path):
     from rfd4_proteina import Proteina
     import rfd4fx.convert  # noqa: F401
 
-    model = Proteina.from_pretrained(SNAPSHOT)
+    model = Proteina.from_pretrained(SNAPSHOT, revision=REV, cache_dir=CACHE)
     model.eval()
     jax_model = RFD4.from_torch(model)
 

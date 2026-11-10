@@ -1,6 +1,4 @@
 import numpy as np, sys, torch
-sys.path.insert(0, '/Users/mjendrusch/repos/rfd4j/rfd4fx/src')
-sys.path.insert(0, '/Users/mjendrusch/repos/rfd4j/RFD4-Proteina/src')
 import jax, jax.numpy as jnp, equinox as eqx
 import rfd4fx.convert
 from rfd4fx.featurize import make_unconditioned_batch
@@ -8,7 +6,7 @@ from rfd4fx.model import RFD4
 from rfd4_proteina import Proteina
 
 torch.manual_seed(0)
-model = Proteina.from_pretrained('/Users/mjendrusch/repos/rfd4j/.hf_cache/hub/models--nvidia--RFD4-Proteina/snapshots/a06e2509c7033b010fc43614e9fd840303588502')
+model = Proteina.from_pretrained('nvidia/RFD4-Proteina')
 model.eval()
 jax_model = RFD4.from_torch(model)
 

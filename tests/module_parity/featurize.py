@@ -12,7 +12,7 @@ import pytest
 import jax
 import jax.numpy as jnp
 
-FIXTURES = pathlib.Path(__file__).resolve().parents[1] / "fixtures" / "torch_batches"
+FIXTURES = pathlib.Path("tests/fixtures/torch_batches")
 pytestmark = pytest.mark.skipif(not FIXTURES.exists(), reason="torch batch fixtures not dumped")
 
 from rfd4fx.featurize import assemble_flow_batch  # noqa: E402

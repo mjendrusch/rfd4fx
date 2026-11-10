@@ -14,11 +14,16 @@ from __future__ import annotations
 import argparse
 import pathlib
 
+# Release weights, fetched from the Hugging Face hub on first use.
 SNAPSHOT = "nvidia/RFD4-Proteina"
+
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpoint", type=str, default=str(SNAPSHOT))
+    parser.add_argument("--checkpoint", type=str, default=SNAPSHOT)
+    parser.add_argument("--cache", type=pathlib.Path, default=None,
+                        help="HF cache dir for the release checkpoint "
+                             "(default: the huggingface default cache)")
     parser.add_argument("--out", type=pathlib.Path,
                         default=pathlib.Path("~/.rfd4fx/models/rfd4_release"))
     args = parser.parse_args()
@@ -33,7 +38,7 @@ def main() -> None:
     from rfd4_proteina import Proteina
 
     print("loading torch release ...", flush=True)
-    model = Proteina.from_pretrained(args.checkpoint)
+    model = Proteina.from_pretrained(args.checkpoint, cache_dir=args.cache)
     model.eval()
     print("converting to equinox ...", flush=True)
     eqx_model = RFD4.from_torch(model)
