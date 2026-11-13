@@ -92,6 +92,10 @@ class RFD4Input(eqx.Module):
     # body (single centroid + rotation over the union) at to_batch time;
     # single-piece groups keep their per-call payload. Cleared after merging.
     _intcrd_sources: tuple = ()
+    # metadata (not an input key): authored bond edges (tok_i, slot_i, tok_j,
+    # slot_j, order, backbone_linkage) — the path-length graph includes
+    # backbone-linkage closures even though they are suppressed from bond_mask
+    _bond_edges: tuple = ()
     token_bond_path_length: Int[Array, "b n n"] | None = None
     bond_mask: Bool[Array, "b n n"] | None = None
     bond_order: Int[Array, "b n n"] | None = None
@@ -132,7 +136,9 @@ class RFD4Input(eqx.Module):
             a dict. Recognized dict keys:
 
             **Polymer chains** — ``num_residues`` (or inferred from the arrays):
-            ``dssp`` (str/array — C_SEC), ``pos`` (float (n, 37, 3), REQUIRED with
+            ``dssp`` (str/array — C_SEC), ``sequence`` (one-letter str — C_SEQ;
+            ``X`` for aa, ``N``/``X`` for dna/rna mark unknown positions and
+            leave C_SEQ unset), ``pos`` (float (n, 37, 3), REQUIRED with
             ``mask``) + ``mask`` (bool (n, 37) present-atoms) — motif conditioning
             (materialized slots, ground-truth coords, C_CRD group ``group``,
             default 0), ``group`` (int — coordinate-group override),
@@ -146,6 +152,21 @@ class RFD4Input(eqx.Module):
             ``{"values", "aa", "where"}`` sub-dicts) with chain-level ``aa`` (int
             (n,)) and ``where`` (bool (n, 37)) defaults. ``hotspot`` of shape
             (n,) requires ``mask`` and applies ``mask & hotspot[:, None]``.
+            String ``hotspot`` ("1,5,6-10", optional ``@ATOM``; 1-indexed) →
+            C_HOT on the sidechain slots of the listed residues (requires
+            ``sequence``); ``auto_condition`` (True → C_HB roles on all
+            sidechain donors/acceptors, requires ``sequence``) and the explicit
+            interaction keys ``h_bond``/``salt_bridge``/``pi_stack``/
+            ``pi_cation`` (residue±atom selection strings like "2@NZ,OE1" →
+            per-atom C_HB/C_SALTBRIDGE/C_PISTACK/C_PICATION on the eligible
+            subset) are mutually exclusive with each other. ``bonds`` (list of
+            ``{"atoms": ["1@NZ", "6@SG"], "order": 1|2|3}``) authors covalent
+            bonds: bond_mask/bond_order on the token pair,
+            incident_bond_type_counts at the endpoints, token_bond_path_length
+            recomputed by BFS (requires ``sequence``; same-token bonds set the
+            counts only). ``cyclic`` (True → head-to-tail C→N closure of the
+            chain with backbone-linkage semantics: canonical_polymer_ordering
+            ±1, suppressed from bond_mask, ring hop counts).
 
             **Ligands** — ``smiles`` (str, RDKit) or ``ccd`` (id, cached CCD via
             gemmi): topology-only atomized tokens (elements, charges, bond
@@ -159,7 +180,17 @@ class RFD4Input(eqx.Module):
             residue types not conditioned). Parsed atom37 positions/mask/
             residue_index/chain_index/residue types are added as indexed motif
             conditioning (C_CRD group 0) on fresh chains, one per selected
-            PDB chain.
+            PDB chain. ``neighbours`` (True → extend the selection with
+            residues of the selection's chains having a sidechain heavy atom
+            within ``cutoff`` of the selected residues; requires ``select``)
+            and ``surface`` (True → keep only Shrake-Rupley-surface
+            neighbours) amend the selection; the base selection is kept.
+            ``bonds`` (list of ``{"atoms": ["A48@NZ", "A51@OE1"],
+            "order": 1|2|3}`` — chain-grammar selectors naming exactly one
+            motif residue+atom each) authors file-absent covalent bonds, and
+            ``cyclic`` (True → head-to-tail C→N closure of each selected
+            chain) adds backbone-linkage closures; both produce the same
+            bond features as the polymer-dict keys.
 
           np_seed: seed for the pipeline's chain/molecule-iid permutations.
           pad_to: if given, pad the compiled input to exactly this TOTAL token
@@ -188,6 +219,7 @@ class RFD4Input(eqx.Module):
         deferred_indexed: list[tuple] = []
         deferred_absolute: list[tuple] = []
         deferred_hotspot: list[dict] = []
+        deferred_bond_edges: list[tuple] = []
         # partially-indexed motifs: a dict with a "motif" list expands into one
         # effective pdb/cif dict per sub-spec ({select, indexed, drop_backbone,
         # ordered}, inheriting the dict-level fixed/group/hotspot/... keys).
@@ -220,6 +252,7 @@ class RFD4Input(eqx.Module):
                     unindexed_pdb_dicts.append(chain)
                 else:
                     actions = _add_pdb_motifs(spec, chain, residue_index_by_chain)
+                    deferred_bond_edges.extend(actions.pop("bond_edges", ()))
                     if actions.get("fixed_false") is not None:
                         deferred_indexed.append(actions["fixed_false"])
                     if actions.get("fixed_true") is not None:
@@ -236,7 +269,12 @@ class RFD4Input(eqx.Module):
                 continue
             chain_index = chain.get("chain_index")
             if chain_index is None:
-                _add_dict_chain(spec, chain, residue_index_by_chain)
+                actions = _add_dict_chain(
+                    spec, chain, residue_index_by_chain,
+                    token_offset=sum(c.num_residues for c in spec.chains))
+                if actions:
+                    deferred_bond_edges.extend(actions.pop("bond_edges", ()))
+                    deferred_hotspot.append(actions)
             else:
                 n = _chain_length(chain)
                 ci_arr = np.asarray(chain_index)
@@ -263,14 +301,15 @@ class RFD4Input(eqx.Module):
             out = out.add_indexed_motif(pos_sys, restype_sys, where_sys,
                                         group=0, fixed=True)
         for actions in deferred_hotspot:
-            if actions.get("hotspot") is not None:
-                vals, where_local, start = actions["hotspot"]
-                out = out.add_hotspot(vals, aa=None, where=where_local,
-                                      start=start)
-            if actions.get("hbond") is not None:
-                hb_vals, start = actions["hbond"]
-                out = out.add_hbond(hb_vals, aa=None, where=hb_vals > 0,
-                                    start=start)
+            for name, adder in _DEFERRED_ADDERS.items():
+                payload = actions.get(name)
+                if payload is None:
+                    continue
+                vals, where, start = payload
+                out = getattr(out, adder)(vals, aa=None, where=where,
+                                          start=start)
+        if deferred_bond_edges:
+            out = _apply_bond_edges(out, deferred_bond_edges)
         # unindexed-motif dicts route through RFD4Input.add_unindexed_motif so
         # ligand routing / fixed semantics are identical on both paths
         for md in motif_dicts:
@@ -285,8 +324,7 @@ class RFD4Input(eqx.Module):
         # mixed indexed/unindexed motifs.
         out = _center_on_conditioned_atoms(out)
         if pad_to is not None:
-            batch2, cc2 = _pad_batch(out.to_batch(), out.coord_cond, int(pad_to))
-            out = cls.from_batch(batch2, cc2)
+            out = _pad_input(out, int(pad_to))
         return out
 
     # ------------------------------------------------------------- consumers
@@ -305,8 +343,7 @@ class RFD4Input(eqx.Module):
         target = ((n + multiple - 1) // multiple) * multiple
         if target == n:
             return self
-        padded_batch, coord_cond = _pad_batch(self.to_batch(), self.coord_cond, target)
-        return RFD4Input.from_batch(padded_batch, coord_cond)
+        return _pad_input(self, target)
 
     def to_dict(self) -> dict:
         """All populated RFD4 input keys -> jnp arrays (unset keys omitted)."""
@@ -737,6 +774,61 @@ class RFD4Input(eqx.Module):
                                     group, fixed=fixed, chem=chem, chain=chain,
                                     ordered=ordered, target_chain=target_chain)
 
+    def add_bonds(self, *bonds) -> "RFD4Input":
+        """Author covalent bonds on the compiled input (functional update).
+
+        Each entry is a tuple ``(res_1, atom_1, res_2, atom_2, order)`` with
+        all indices 0-based into the ``(num_residues, 37)`` atom array
+        (res = token index, atom = atom37 slot) and ``order`` ∈ {1, 2, 3}.
+
+        Sets `bond_mask`/`bond_order` (symmetric) for the token pair,
+        increments `incident_bond_type_counts` at all four endpoint slots
+        (biotite ids: single=1, double=2, triple=3), and recomputes
+        `token_bond_path_length` by BFS over consecutive-token adjacency plus
+        the authored edges. Bonds within one token set the counts only (no
+        pair-track representation). Features are identical to authoring the
+        same bonds through `from_chains` `"bonds"` keys.
+        """
+        n = int(np.asarray(self.padding_mask).shape[1])
+        edges = []
+        for bond in bonds:
+            r1, a1, r2, a2, order = bond
+            if not (0 <= int(r1) < n and 0 <= int(r2) < n):
+                raise ValueError(
+                    f"add_bonds: residue indices {(r1, r2)} outside 0..{n - 1}")
+            if not (0 <= int(a1) < 37 and 0 <= int(a2) < 37):
+                raise ValueError(
+                    f"add_bonds: atom indices {(a1, a2)} outside 0..36")
+            if int(order) not in (1, 2, 3):
+                raise ValueError(
+                    f"add_bonds: order must be 1, 2 or 3, got {order!r}")
+            edges.append((int(r1), int(a1), int(r2), int(a2), int(order), False))
+        return _apply_bond_edges(self, edges)
+
+    def cyclize(self, chain_index: int) -> "RFD4Input":
+        """Head-to-tail closure of one polymer chain (functional update).
+
+        Bonds `C` (atom37 slot 2) of the chain's LAST token to `N` (slot 0) of
+        its FIRST token with backbone-linkage semantics: `bond_mask` stays
+        False (suppressed), `canonical_polymer_ordering[first, last] = +1`
+        (first = downstream N-entering, last = upstream C-leaving) and -1 at
+        the transpose, `incident_bond_type_counts` +1 (single) on both closure
+        atoms, and `token_bond_path_length` recomputed through the closure
+        edge (ring hop counts).
+
+        `chain_index` selects the polymer chain by 0-based from_chains add
+        order (mapped through the first-appearance order of `chain_iid`).
+        """
+        ranges = _chain_token_ranges(self)
+        if not 0 <= int(chain_index) < len(ranges):
+            raise ValueError(
+                f"cyclize: chain_index {chain_index} outside 0..{len(ranges) - 1}")
+        start, end = ranges[int(chain_index)]
+        if end - start < 2:
+            raise ValueError(
+                f"cyclize: chain {chain_index} has fewer than 2 tokens")
+        return _apply_bond_edges(self, [(end - 1, 2, start, 0, 1, True)])
+
     def _add_atom_level(self, field: str, values, aa, where=True, start: int = 0) -> "RFD4Input":
         """Shared atom-level edit over residues ``start:start + k`` (k resolved
         from an array `where`, else a 1-D `values`, else `aa`).
@@ -832,11 +924,96 @@ class RFD4Input(eqx.Module):
                                    **out_kwargs)
 
 
+def _recompute_token_path_lengths(n: int, edges) -> np.ndarray:
+    """BFS hop counts over consecutive-token adjacency + authored bond edges
+    (native _compute_token_path_lengths semantics, unclipped; the closure
+    edge of a ring IS part of the graph — verified against the native
+    pipeline on the head-to-tail fixture)."""
+    idx = np.arange(n, dtype=np.int32)
+    dist = np.abs(idx[:, None] - idx[None, :]).astype(np.int32)
+    pairs = [(int(e[0]), int(e[2])) for e in edges if int(e[0]) != int(e[2])]
+    if not pairs or n == 0:
+        return dist
+    portals = np.array(sorted({p for ab in pairs for p in ab}), dtype=np.int32)
+    p_of = {int(p): i for i, p in enumerate(portals)}
+    dp = np.abs(portals[:, None] - portals[None, :]).astype(np.int32)
+    for a, b in pairs:
+        pa, pb = p_of[a], p_of[b]
+        dp[pa, pb] = min(int(dp[pa, pb]), 1)
+        dp[pb, pa] = min(int(dp[pb, pa]), 1)
+    for k in range(len(portals)):
+        np.minimum(dp, dp[:, k:k + 1] + dp[k:k + 1, :], out=dp)
+    d_to_p = np.abs(idx[:, None] - portals[None, :]).astype(np.int32)
+    via_p = (d_to_p[:, :, None] + dp[None, :, :]).min(axis=1)
+    for q_i in range(len(portals)):
+        np.minimum(dist, via_p[:, q_i:q_i + 1] + d_to_p[:, q_i:q_i + 1].T, out=dist)
+    return dist
+
+
+def _apply_bond_edges(inp: "RFD4Input", edges) -> "RFD4Input":
+    """Author token-level bond edges on a compiled input.
+
+    Each edge: `(tok_i, slot_i, tok_j, slot_j, order, backbone_linkage)`.
+    Non-backbone edges set `bond_mask`/`bond_order` (symmetric); backbone
+    linkages (head-to-tail closures) are suppressed from `bond_mask` and set
+    `canonical_polymer_ordering` (+1 at [downstream, upstream]) instead —
+    bonds.py semantics, see info.md. Both kinds increment
+    `incident_bond_type_counts` at every endpoint slot and recompute
+    `token_bond_path_length` over the full edge set."""
+    n = int(np.asarray(inp.padding_mask).shape[1])
+    zeros_bm = np.zeros((n, n), dtype=bool)
+    zeros_i = np.zeros((n, n), np.int32)
+    bm = (np.asarray(inp.bond_mask)[0].copy() if inp.bond_mask is not None
+          else zeros_bm)
+    bo = (np.asarray(inp.bond_order)[0].copy() if inp.bond_order is not None
+          else zeros_i)
+    canon = (np.asarray(inp.canonical_polymer_ordering)[0].copy()
+             if inp.canonical_polymer_ordering is not None else zeros_i)
+    inc = (np.asarray(inp.incident_bond_type_counts)[0].copy()
+           if inp.incident_bond_type_counts is not None
+           else np.zeros((n, 37, 10), np.float32))
+    all_edges = tuple(getattr(inp, "_bond_edges", ())) + tuple(edges)
+    for ti, si, tj, sj, order, backbone in edges:
+        if backbone:
+            canon[tj, ti] = 1        # tj = downstream (entering N)
+            canon[ti, tj] = -1       # ti = upstream (leaving C)
+        elif ti != tj:
+            bm[ti, tj] = bm[tj, ti] = True
+            bo[ti, tj] = bo[tj, ti] = order
+        inc[ti, si, order] += 1.0
+        inc[tj, sj, order] += 1.0
+    pl = _recompute_token_path_lengths(n, all_edges)
+    return dataclasses.replace(
+        inp, bond_mask=jnp.asarray(bm)[None],
+        bond_order=jnp.asarray(bo)[None],
+        canonical_polymer_ordering=jnp.asarray(canon)[None],
+        incident_bond_type_counts=jnp.asarray(inc)[None],
+        token_bond_path_length=jnp.asarray(pl)[None],
+        _bond_edges=tuple(all_edges))
+
+
+def _chain_token_ranges(inp: "RFD4Input") -> list[tuple[int, int]]:
+    """(start, end) token ranges of the polymer chains, in first-appearance
+    order of their chain_iid values (== from_chains add order)."""
+    ciid = np.asarray(inp.chain_iid)[0]
+    ranges: list[tuple[int, int]] = []
+    seen: dict[float, int] = {}
+    for t, v in enumerate(ciid):
+        if v not in seen:
+            seen[v] = len(ranges)
+            ranges.append([t, t + 1])
+        else:
+            ranges[seen[v]][1] = t + 1
+    return [(int(a), int(b)) for a, b in ranges]
+
+
 def _chain_length(chain: dict) -> int:
     """Infer a dict chain's residue count (explicit key first, then contents)."""
     for key in ("num_residues", "length"):
         if key in chain:
             return int(chain[key])
+    if "sequence" in chain:
+        return len(chain["sequence"])
     if "dssp" in chain:
         return len(chain["dssp"])
     if "bp" in chain:
@@ -925,8 +1102,114 @@ def _slice_chain_dict(chain: dict, sel: np.ndarray) -> dict:
     return sub
 
 
-def _add_dict_chain(spec, chain: dict, residue_index_by_chain: dict) -> None:
-    """One polymer-chain dict → spec chain (+ its conditions)."""
+_AA_BACKBONE = frozenset({"N", "CA", "C", "O", "OXT"})
+_NA_BACKBONE = frozenset({"P", "OP1", "OP2", "O5'", "C5'", "C4'", "C3'", "O3'"})
+_NA_SUGAR = frozenset({"C1'", "C2'", "C3'", "O2'", "O4'"})
+
+
+def _sidechain_slots(res_name: str, kind: str) -> np.ndarray:
+    """Atom37 slot indices of one residue's sidechain: AA = every non-backbone
+    slot; NA = base slots only (sugar-phosphate backbone and sugar excluded).
+    Unknown (ambiguous-letter) residues have no sidechain."""
+    from rfproteina.encoding import UNIFIED_ATOM37_ENCODING as ENC
+
+    from .spec import _AMBIGUOUS_NAMES
+
+    if res_name in _AMBIGUOUS_NAMES:
+        return np.zeros(0, np.int64)
+    excluded = _AA_BACKBONE if kind == "aa" else (_NA_BACKBONE | _NA_SUGAR)
+    return np.asarray(
+        [s for s, name in enumerate(ENC.token_atoms[res_name])
+         if str(name).strip() and str(name).strip() not in excluded], np.int64)
+
+
+def _table_hbond_roles(res_name: str, atom_names) -> dict[str, int]:
+    """C_HB roles (1=donor, 2=acceptor, 3=both) from the native atomworks
+    (res_name, atom_name) tables only — no coordinate-based fallback."""
+    from atomworks.ml.transforms import interactions as _ia
+
+    roles: dict[str, int] = {}
+    for an in atom_names:
+        donor = ("*", an) in _ia._DONOR_ATOMS or (res_name, an) in _ia._DONOR_ATOMS
+        acceptor = ("*", an) in _ia._ACCEPTOR_TABLE or (res_name, an) in _ia._ACCEPTOR_TABLE
+        if donor and acceptor:
+            roles[an] = 3
+        elif donor:
+            roles[an] = 1
+        elif acceptor:
+            roles[an] = 2
+    return roles
+
+
+# from_chains interaction-condition keys -> compiled channel names
+_INTERACTION_KEYS = ("h_bond", "salt_bridge", "pi_stack", "pi_cation")
+_INTERACTION_CHANNEL = {"h_bond": "hbond", "salt_bridge": "saltbridge",
+                        "pi_stack": "pistack", "pi_cation": "pication"}
+
+# deferred from_chains payloads: channel name -> RFD4Input adder
+_DEFERRED_ADDERS = {"hotspot": "add_hotspot", "hbond": "add_hbond",
+                    "pistack": "add_pistack", "pication": "add_pication",
+                    "saltbridge": "add_saltbridge"}
+
+
+def _resolve_seq_atom(selector: str, names3: list[str]) -> tuple[int, int]:
+    """Resolve a hotspot-syntax atom selector ("2@NZ"; 1-based residue) to a
+    0-based (residue, atom37 slot). The @ atom specification is required and
+    must name exactly one atom of the residue."""
+    import re
+    from rfproteina.encoding import UNIFIED_ATOM37_ENCODING as ENC
+
+    m = re.fullmatch(r"(\d+)@([\w,'\-\[\]]+)", selector.strip())
+    if m is None:
+        raise ValueError(
+            f"from_chains: bond selector {selector!r} must be 'RES@ATOM' "
+            "(1-based residue, required @ATOM)")
+    res = int(m.group(1))
+    if not 1 <= res <= len(names3):
+        raise ValueError(
+            f"from_chains: bond selector {selector!r} outside 1..{len(names3)}")
+    an = m.group(2)
+    slots = [s for s, nm in enumerate(ENC.token_atoms[names3[res - 1]])
+             if str(nm).strip() == an]
+    if len(slots) != 1:
+        raise ValueError(
+            f"from_chains: bond selector {selector!r} does not name exactly "
+            f"one atom of {names3[res - 1]}")
+    return res - 1, slots[0]
+
+
+def _parse_residue_list(text: str, n: int) -> list[int]:
+    """Parse a 1-indexed, comma-separated residue list ("1,5,6-10"; ranges
+    inclusive) into 0-based indices, validated against 1..n."""
+    out: list[int] = []
+    for part in text.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        lo, sep, hi = part.partition("-")
+        try:
+            lo_i, hi_i = int(lo), int(hi if sep else lo)
+        except ValueError:
+            raise ValueError(
+                f"from_chains: malformed residue list entry {part!r} "
+                f"(expected an index or 'lo-hi')") from None
+        if not 1 <= lo_i <= hi_i <= n:
+            raise ValueError(
+                f"from_chains: residue-list entry {part!r} outside 1..{n}")
+        out.extend(range(lo_i - 1, hi_i))
+    return out
+
+
+def _add_dict_chain(spec, chain: dict, residue_index_by_chain: dict,
+                    token_offset: int = 0) -> dict | None:
+    """One polymer-chain dict → spec chain (+ its conditions).
+
+    `token_offset` is the chain's first token in the compiled layout (the sum
+    of previously added spec chains' lengths); string "hotspot" residue lists
+    and "auto_condition" hbond conditioning are applied post-compile at that
+    offset. Returns deferred actions for from_chains, or None."""
+    from .spec import sequence_to_names
+
     # polymer kind: "aa"/"AA", "dna"/"DNA", "rna"/"RNA" (strict); "bp" implies
     # a nucleic-acid chain and conflicts with "dssp" (protein SS)
     _KINDS = {"aa": "aa", "AA": "aa", "dna": "dna", "DNA": "dna",
@@ -947,6 +1230,113 @@ def _add_dict_chain(spec, chain: dict, residue_index_by_chain: dict) -> None:
             f"(the chain is {kind!r})")
     n = _chain_length(chain)
     ci = spec.add_chain(n, kind=kind)
+    actions: dict = {}
+    seq_str = chain.get("sequence")
+    if seq_str is not None:
+        if not isinstance(seq_str, str):
+            raise ValueError(
+                "from_chains: 'sequence' must be a one-letter-code string")
+        if len(seq_str) != n:
+            raise ValueError(
+                f"from_chains: 'sequence' length {len(seq_str)} does not match "
+                f"the chain length {n}")
+        spec.add_sequence(seq_str, chain=ci)
+    if isinstance(chain.get("hotspot"), str):
+        # residue-list hotspot: C_HOT on the sidechain slots of the listed
+        # (1-indexed) residues — requires a sequence for the slot layout
+        if seq_str is None:
+            raise ValueError(
+                "from_chains: a string 'hotspot' residue list requires 'sequence'")
+
+        names3 = sequence_to_names(seq_str, kind)
+        where = np.zeros((n, 37), dtype=bool)
+        for i0 in _parse_residue_list(chain["hotspot"], n):
+            where[i0, _sidechain_slots(names3[i0], kind)] = True
+        if not where.any():
+            raise ValueError(
+                "from_chains: none of the hotspot residues has sidechain slots "
+                "to condition")
+        actions["hotspot"] = (np.int32(1), where, token_offset)
+    if chain.get("auto_condition") is True:
+        # C_HB donor/acceptor roles on all sidechain donors/acceptors of the
+        # added chain (table lookup only — no coordinates to probe)
+        if seq_str is None:
+            raise ValueError("from_chains: 'auto_condition' requires 'sequence'")
+        from rfproteina.encoding import UNIFIED_ATOM37_ENCODING as ENC
+
+        hb = np.zeros((n, 37), dtype=np.int32)
+        for i, rn in enumerate(sequence_to_names(seq_str, kind)):
+            slots = _sidechain_slots(rn, kind)
+            slot_names = [str(ENC.token_atoms[rn][s]).strip() for s in slots]
+            for s, role in zip(slots, map(_table_hbond_roles(rn, slot_names).get,
+                                          slot_names)):
+                hb[i, s] = role or 0
+        if (hb > 0).any():
+            actions["hbond"] = (hb, hb > 0, token_offset)
+    explicit_inter = {k: chain[k] for k in _INTERACTION_KEYS if k in chain}
+    if explicit_inter and chain.get("auto_condition") is True:
+        raise ValueError(
+            "from_chains: 'auto_condition' cannot be combined with explicit "
+            "interaction keys (h_bond/salt_bridge/pi_stack/pi_cation)")
+    if explicit_inter:
+        if seq_str is None:
+            raise ValueError("from_chains: interaction keys require 'sequence'")
+        from rfproteina.encoding import UNIFIED_ATOM37_ENCODING as ENC
+
+        names3 = sequence_to_names(seq_str, kind)
+        for key, text in explicit_inter.items():
+            if not isinstance(text, str):
+                raise ValueError(
+                    f"from_chains: {key!r} must be a selection string "
+                    "('1,5,6-10' or '2@NZ,OE1')")
+            ivals = np.zeros((n, 37),
+                             dtype=bool if key == "pi_stack" else np.int32)
+            iwhere = np.zeros((n, 37), dtype=bool)
+            hit = False
+            for i0, i_atoms in _parse_seq_selection(text, n):
+                slots = _sidechain_slots(names3[i0], kind)
+                slot_names = [str(ENC.token_atoms[names3[i0]][s]).strip()
+                              for s in slots]
+                values = _seq_interaction_values(key, names3[i0], set(slot_names))
+                for s, an in zip(slots, slot_names):
+                    if an in values and (i_atoms is None or an in i_atoms):
+                        iwhere[i0, s] = True
+                        ivals[i0, s] = values[an]
+                        hit = True
+            if hit:
+                actions[_INTERACTION_CHANNEL[key]] = (ivals, iwhere, token_offset)
+            else:
+                _warn_empty_selection(key, text)
+    chain_edges: list[tuple] = []
+    explicit_bonds = chain.get("bonds")
+    if explicit_bonds is not None:
+        if seq_str is None:
+            raise ValueError("from_chains: 'bonds' requires 'sequence'")
+        if not isinstance(explicit_bonds, (list, tuple)):
+            raise ValueError(
+                "from_chains: 'bonds' must be a list of "
+                "{'atoms': [selector, selector], 'order': 1|2|3} dicts")
+        names3 = sequence_to_names(seq_str, kind)
+        for entry in explicit_bonds:
+            atoms = entry.get("atoms") if isinstance(entry, dict) else None
+            order = entry.get("order", 1) if isinstance(entry, dict) else None
+            if (not isinstance(atoms, (list, tuple)) or len(atoms) != 2
+                    or int(order) not in (1, 2, 3)):
+                raise ValueError(
+                    "from_chains: each 'bonds' entry must be "
+                    "{'atoms': [selector, selector], 'order': 1|2|3}")
+            (t_i, s_i), (t_j, s_j) = (_resolve_seq_atom(a, names3)
+                                      for a in atoms)
+            chain_edges.append((token_offset + t_i, s_i, token_offset + t_j,
+                                s_j, int(order), False))
+    if chain.get("cyclic") is True:
+        if seq_str is None:
+            raise ValueError("from_chains: 'cyclic' requires 'sequence'")
+        chain_edges.append((token_offset + n - 1, 2, token_offset, 0, 1, True))
+    elif chain.get("cyclic") not in (False, None):
+        raise ValueError("from_chains: 'cyclic' must be True or False")
+    if chain_edges:
+        actions["bond_edges"] = chain_edges
     if "bp" in chain:
         spec.add_bp(chain["bp"], chain=ci)
     if "dssp" in chain:
@@ -972,6 +1362,8 @@ def _add_dict_chain(spec, chain: dict, residue_index_by_chain: dict) -> None:
     for name in _ATOM_LEVEL:
         if name not in chain:
             continue
+        if name == "hotspot" and isinstance(chain[name], str):
+            continue  # residue-list hotspot: handled post-compile above
         item = chain[name]
         if isinstance(item, dict):
             values, aa, where = (item.get("values"), item.get("aa"),
@@ -1003,10 +1395,11 @@ def _add_dict_chain(spec, chain: dict, residue_index_by_chain: dict) -> None:
                     f"from_chains: atom-level {name!r} needs 'where' (a (n, 37) "
                     "atom37 slot mask), or 'pos' + 'mask' to materialize slots")
         getattr(spec, f"add_{name}")(values, aa=aa, where=where, chain=ci)
+    return actions or None
 
 
 _LIGAND_DICT_KEYS = ("smiles", "ccd", "ligand_pos", "res_name",
-                     "auto_condition", "buried")
+                     "auto_condition", "buried") + _INTERACTION_KEYS
 
 
 def _add_ligand(spec, chain: dict) -> None:
@@ -1016,13 +1409,22 @@ def _add_ligand(spec, chain: dict) -> None:
     (C_PISTACK on aromatic-ring atoms, C_HB donor/acceptor roles, C_SALT
     charge-sign roles — rfd4fx.ligand_conditions, native AnnotateInter-
     actions ligand semantics). "buried": True sets C_RAS 1 (buried) on every
-    atom of the ligand chain. Unknown keys raise (typo guard).
+    atom of the ligand chain. The explicit interaction keys ("h_bond",
+    "salt_bridge", "pi_stack", "pi_cation") take 1-based atom-index selection
+    strings ("1,3-5", in SMILES/CCD atom order) and condition only the
+    eligible subset of those atoms; they cannot be combined with
+    "auto_condition". Unknown keys raise (typo guard).
     """
     unknown = sorted(set(chain) - set(_LIGAND_DICT_KEYS))
     if unknown:
         raise ValueError(
             f"from_chains: unknown ligand key(s) {unknown} — supported: "
             f"{list(_LIGAND_DICT_KEYS)}")
+    explicit_inter = {k: chain[k] for k in _INTERACTION_KEYS if k in chain}
+    if explicit_inter and chain.get("auto_condition"):
+        raise ValueError(
+            "from_chains: 'auto_condition' cannot be combined with explicit "
+            "interaction keys (h_bond/salt_bridge/pi_stack/pi_cation)")
     kwargs = {}
     if "ligand_pos" in chain:
         kwargs["ligand_pos"] = chain["ligand_pos"]
@@ -1034,6 +1436,39 @@ def _add_ligand(spec, chain: dict) -> None:
         from .ligand_conditions import ligand_roles
 
         lig.interactions = ligand_roles(lig.elements, lig.charges, lig.bonds)
+    elif explicit_inter:
+        from .ligand_conditions import (SALT_POSITIVE, ligand_roles)
+
+        k = int(lig.elements.shape[0])
+        roles = ligand_roles(lig.elements, lig.charges, lig.bonds)
+        interactions = {"hbond": np.zeros(k, np.int8),
+                        "pistack": np.zeros(k, bool),
+                        "salt": np.zeros(k, np.int8),
+                        "pication": np.zeros(k, np.int8)}
+        for key, text in explicit_inter.items():
+            if not isinstance(text, str):
+                raise ValueError(
+                    f"from_chains: ligand {key!r} must be a 1-based atom-index "
+                    "selection string (e.g. '1,3-5')")
+            hit = False
+            for i0 in _parse_residue_list(text, k):
+                if key == "h_bond" and roles["hbond"][i0]:
+                    interactions["hbond"][i0] = roles["hbond"][i0]
+                elif key == "salt_bridge" and roles["salt"][i0]:
+                    interactions["salt"][i0] = roles["salt"][i0]
+                elif key == "pi_stack" and roles["pistack"][i0]:
+                    interactions["pistack"][i0] = True
+                elif key == "pi_cation":
+                    if roles["pistack"][i0]:
+                        interactions["pication"][i0] = 1      # AROMATIC
+                    elif roles["salt"][i0] == SALT_POSITIVE:
+                        interactions["pication"][i0] = 2      # CATION
+                else:
+                    continue
+                hit = True
+            if not hit:
+                _warn_empty_selection(key, text)
+        lig.interactions = interactions
     if chain.get("buried"):
         lig.buried = True
 
@@ -1211,18 +1646,27 @@ def _add_pdb_unindexed_motif(inp: "RFD4Input", chain: dict) -> "RFD4Input":
     ordered = bool(chain.get("ordered", False))
     drop_backbone = bool(chain.get("drop_backbone", False))
     sel = _apply_interface_selection(model, sel, names, chain)
+    sel = _apply_neighbour_selection(model, sel, names, chain)
+    hotspot_sel = _pdb_hotspot_sel(chain, model, sel, names)
+    auto_condition = bool(chain.get("auto_condition"))
+    inter_sel = _interaction_sel(chain, model, sel, names)
+    if inter_sel and auto_condition:
+        raise ValueError(
+            "from_chains: 'auto_condition' cannot be combined with explicit "
+            "interaction keys (h_bond/salt_bridge/pi_stack/pi_cation)")
     # "target_chain": pin the unindexed motif residues' chain_iid (int value
     # or A-Z character index) instead of minting a fresh chain; ligand runs
     # always keep their own fresh chains (native hard rule)
     target_iid = (_resolve_target_chain(chain["target_chain"])
                   if "target_chain" in chain else None)
-    hotspot_sel = _pdb_hotspot_sel(chain, model, sel, names)
-    auto_condition = bool(chain.get("auto_condition"))
     hotspot = chain.get("hotspot")
 
     pos_rows, mask_rows, aa_rows, ri_rows, ci_rows = [], [], [], [], []
+    motif_res_unidx: list[tuple[str, object, np.ndarray]] = []
     hotspot_where: list[tuple[int, int]] = []
     hbond_hot: list[tuple[int, int, int]] = []
+    inter_hot: dict[str, list[tuple[int, int, object]]] = {
+        k: [] for k in (inter_sel or {})}
     lig_elements: list[int] = []
     lig_charges: list[int] = []
     lig_bonds: list[tuple[int, int, int, int]] = []
@@ -1293,6 +1737,20 @@ def _add_pdb_unindexed_motif(inp: "RFD4Input", chain: dict) -> "RFD4Input":
                                     if (str(slot_name).strip() == an
                                             and mask37[s]):
                                         hbond_hot.append((len(pos_rows), s, role))
+                for key, res_map in (inter_sel or {}).items():
+                    ic = res_map.get(name, {})
+                    if "*" not in ic and res.seqid.num not in ic:
+                        continue
+                    i_atoms = ic.get("*", ic.get(res.seqid.num))
+                    ivalues = _interaction_residue_values(
+                        key, res, i_atoms, chain.get("ligands"))
+                    for s, an in enumerate(
+                            str(nm).strip()
+                            for nm in ENC.token_atoms.get(res.name, ("",) * 37)):
+                        if mask37[s] and an and an in ivalues and (
+                                i_atoms is None or an in i_atoms):
+                            inter_hot[key].append((len(pos_rows), s, ivalues[an]))
+                motif_res_unidx.append((name, res, mask37))
                 pos_rows.append(n37)
                 mask_rows.append(mask37)
                 aa_rows.append(ENC.token_to_idx.get(res.name, 0))
@@ -1302,6 +1760,9 @@ def _add_pdb_unindexed_motif(inp: "RFD4Input", chain: dict) -> "RFD4Input":
                 # HETATM ligand: one atomized <A> token per heavy atom
                 elements, charges, bonds = _ligand_chemistry_from_residue(
                     res, chain.get("ligands"))
+                ivalues_all = {key: _interaction_residue_values(
+                    key, res, atom_sel, chain.get("ligands"))
+                    for key in (inter_sel or {})}
                 file_to_lig: dict[int, int] = {}
                 h_atoms = None
                 if hotspot_sel is not None:
@@ -1329,6 +1790,10 @@ def _add_pdb_unindexed_motif(inp: "RFD4Input", chain: dict) -> "RFD4Input":
                         hotspot_where.append((len(pos_rows) - 1, 1))
                         if an in roles:
                             hbond_hot.append((len(pos_rows) - 1, 1, roles[an]))
+                    for key in (inter_sel or {}):
+                        v = ivalues_all[key].get(an)
+                        if v is not None and v:
+                            inter_hot[key].append((len(pos_rows) - 1, 1, v))
                 next_iid += 1.0
                 for i, j, order, arom in bonds:
                     if i in file_to_lig and j in file_to_lig:
@@ -1365,6 +1830,22 @@ def _add_pdb_unindexed_motif(inp: "RFD4Input", chain: dict) -> "RFD4Input":
         for r, s_, role in hbond_hot:
             hb[r, s_] = role
         out = out.add_hbond(hb, aa=None, where=hb > 0, start=block_start)
+    for key, hits in inter_hot.items():
+        if not hits:
+            for entry in chain[key]:
+                _warn_empty_selection(key, entry)
+            continue
+        ivals = np.zeros((len(pos), 37),
+                         dtype=bool if key == "pi_stack" else np.int32)
+        iwhere = np.zeros((len(pos), 37), bool)
+        for r, s_, v in hits:
+            ivals[r, s_] = v
+            iwhere[r, s_] = True
+        out = getattr(out, _DEFERRED_ADDERS[_INTERACTION_CHANNEL[key]])(
+            ivals, aa=None, where=iwhere, start=block_start)
+    bond_edges = _pdb_bond_edges(chain, model, motif_res_unidx, block_start)
+    if bond_edges:
+        out = _apply_bond_edges(out, bond_edges)
     return out
 
 
@@ -1427,18 +1908,25 @@ def _apply_interface_selection(model, sel, names, chain: dict):
         pdb_chain = model[name]
         if pdb_chain is None:
             continue
-        hits: set[int] = set()
+        atom_rows: list[list[float]] = []
+        atom_seqids: list[int] = []
         for res in pdb_chain:
             if res.name in ("HOH", "DOD", "WAT"):
                 continue
+            seq_num = res.seqid.num
             for a in res:
                 if a.element.name.upper() in ("H", "D"):
                     continue
-                d2 = ((a.pos.x - acc[:, 0]) ** 2 + (a.pos.y - acc[:, 1]) ** 2
-                      + (a.pos.z - acc[:, 2]) ** 2)
-                if (d2 < c2).any():
-                    hits.add(res.seqid.num)
-                    break
+                atom_rows.append([a.pos.x, a.pos.y, a.pos.z])
+                atom_seqids.append(seq_num)
+        hits: set[int] = set()
+        if atom_rows:
+            pts = np.asarray(atom_rows, np.float32)
+            seq_arr = np.asarray(atom_seqids, np.int64)
+            for lo in range(0, len(pts), 4096):
+                block = pts[lo:lo + 4096]
+                d2 = ((block[:, None, :] - acc[None, :, :]) ** 2).sum(-1)
+                hits.update(int(x) for x in seq_arr[lo:lo + 4096][(d2 < c2).any(1)])
         iface[name] = hits
 
     def _restrict(nm, res_map):
@@ -1463,6 +1951,154 @@ def _apply_interface_selection(model, sel, names, chain: dict):
         return out
     return {nm: (res_map if nm == interface_to else _restrict(nm, res_map))
             for nm, res_map in sel.items()}
+
+
+def is_surface(position, occluders, *, radius=4.0, n_points=64, threshold=0.2):
+    """Vectorized Shrake-Rupley surface test on CB positions (numpy only).
+
+    Places ``n_points`` test points (golden-spiral lattice) on a sphere of
+    ``radius`` around every position in ``position`` (CB coordinates); a
+    point is exposed when no position in ``occluders`` (backbone heavy atoms)
+    lies within ``radius`` of it. A position is surface when the exposed
+    fraction of its test points is >= ``threshold``.
+
+    Occlusion test: the point ``c + r*u`` is covered by an occluder ``o``
+    iff ``(o - c)/|o - c| . u > |o - c| / (2r)``, so only dot products per
+    (CB, occluder, test point) triple are needed; CBs are processed in
+    chunks to bound memory.
+    """
+    position = np.asarray(position, np.float64).reshape(-1, 3)
+    occluders = np.asarray(occluders, np.float64).reshape(-1, 3)
+    if not len(position):
+        return np.zeros(0, bool)
+    if not len(occluders):
+        return np.ones(len(position), bool)
+    # golden-spiral unit-sphere test points
+    k = (np.arange(n_points) + 0.5) / n_points
+    unit = np.stack([
+        np.sqrt(1 - k * k) * np.cos(2 * np.pi * k * (1 + 5 ** 0.5) / 2),
+        np.sqrt(1 - k * k) * np.sin(2 * np.pi * k * (1 + 5 ** 0.5) / 2),
+        1 - 2 * k,
+    ], axis=1)                                                   # (P, 3)
+    exposed = np.empty(len(position), np.float64)
+    # occluders farther than 2*radius can never cover any test point
+    chunk = max(1, int(4e6 / max(1, n_points)))
+    for lo in range(0, len(position), chunk):
+        c = position[lo:lo + chunk]                              # (C, 3)
+        d = occluders[None, :, :] - c[:, None, :]                # (C, M, 3)
+        s = (d * d).sum(-1)                                      # (C, M)
+        keep = s.min(0) <= (2 * radius) ** 2
+        if not keep.any():
+            exposed[lo:lo + chunk] = 1.0
+            continue
+        d, s = d[:, keep], s[:, keep]                            # (C, M', 3)
+        dot = np.einsum("cmd,pd->cmp", d, unit)                  # (C, M', P)
+        covered = dot > s[:, :, None] / (2 * radius)
+        exposed[lo:lo + chunk] = (~covered).all(1).mean(1)
+    return exposed >= threshold
+
+
+def _apply_neighbour_selection(model, sel, names, chain: dict):
+    """pdb/cif dict "neighbours" support: extend the parsed selection with
+    neighbouring residues — residues of the selection's chains with at least
+    one sidechain heavy atom (not N/CA/C/O/OXT, not H/D) within ``cutoff``
+    of any heavy atom of the selected residues. Neighbours join as whole
+    residues; the base selection is always kept. With "surface"=True only
+    neighbours whose CB passes :func:`is_surface` (Shrake-Rupley against
+    backbone-atom occluders) are added. Requires a parsed selection."""
+    if not chain.get("neighbours"):
+        return sel
+    if sel is None:
+        raise ValueError(
+            "from_chains: neighbours=True requires a 'select' entry")
+    cutoff = float(chain.get("cutoff", 4.5))
+    backbone = {"N", "CA", "C", "O", "OXT"}
+
+    # anchor: all heavy atoms of the selected (base) residues
+    base: dict[str, set[int]] = {}
+    anchor: list[np.ndarray] = []
+    for name, res_map in sel.items():
+        pdb_chain = model[name]
+        if pdb_chain is None:
+            continue
+        nums: set[int] = set()
+        for rn in res_map:
+            if rn == "*":
+                nums.update(res.seqid.num for res in pdb_chain
+                            if res.name not in ("HOH", "DOD", "WAT"))
+            else:
+                nums.add(rn)
+        base[name] = nums
+        anchor.extend(
+            np.asarray([[a.pos.x, a.pos.y, a.pos.z] for a in res
+                        if a.element.name.upper() not in ("H", "D")],
+                       np.float32)
+            for res in pdb_chain
+            if res.seqid.num in nums
+            and res.name not in ("HOH", "DOD", "WAT"))
+    if not anchor:
+        return sel
+    anchors = np.concatenate(anchor, 0)
+
+    # candidates: sidechain heavy atoms of the selection's chains' residues
+    cand_rows: list[np.ndarray] = []
+    cand_ids: list[tuple[str, int]] = []
+    row_owner: list[int] = []
+    for name in names:
+        pdb_chain = model[name]
+        if pdb_chain is None:
+            continue
+        for res in pdb_chain:
+            if (res.name in ("HOH", "DOD", "WAT")
+                    or res.seqid.num in base.get(name, ())):
+                continue
+            sc = np.asarray(
+                [[a.pos.x, a.pos.y, a.pos.z] for a in res
+                 if a.name.strip() not in backbone
+                 and a.element.name.upper() not in ("H", "D")], np.float32)
+            if len(sc):
+                row_owner.extend([len(cand_ids)] * len(sc))
+                cand_rows.append(sc)
+                cand_ids.append((name, res.seqid.num))
+    if not cand_rows:
+        return sel
+    cand = np.concatenate(cand_rows, 0)
+    owner = np.asarray(row_owner, np.int64)
+
+    # a candidate is a neighbour iff any of its sidechain heavy atoms lies
+    # within cutoff of any anchor heavy atom
+    near = np.zeros(len(cand_ids), bool)
+    c2 = cutoff * cutoff
+    for lo in range(0, len(cand), 4096):
+        block = cand[lo:lo + 4096]                               # (B, 3)
+        d2 = ((block[:, None, :] - anchors[None, :, :]) ** 2).sum(-1)
+        hits = owner[lo:lo + 4096][(d2 < c2).any(1)]
+        near[hits] = True
+    neighbours = [cid for cid, hit in zip(cand_ids, near) if hit]
+    if chain.get("surface") and neighbours:
+        cb_pos, cb_ids, occ = [], [], []
+        for c in model:
+            for res in c:
+                if res.name in ("HOH", "DOD", "WAT"):
+                    continue
+                for a in res:
+                    an = a.name.strip()
+                    if a.element.name.upper() in ("H", "D"):
+                        continue
+                    p = [a.pos.x, a.pos.y, a.pos.z]
+                    if an == "CB":
+                        cb_pos.append(p)
+                        cb_ids.append((c.name, res.seqid.num))
+                    elif an in backbone:
+                        occ.append(p)
+        surf = is_surface(cb_pos, occ)
+        keep = {cb_ids[i] for i in np.flatnonzero(surf)}
+        neighbours = [cid for cid in neighbours if cid in keep]
+
+    out = {nm: dict(res_map) for nm, res_map in sel.items()}
+    for nm, rn in neighbours:
+        out.setdefault(nm, {}).setdefault(rn, None)
+    return out
 
 
 def _residue_hbond_roles(res, atom_names) -> dict[str, int]:
@@ -1500,6 +2136,289 @@ def _residue_hbond_roles(res, atom_names) -> dict[str, int]:
         elif acceptor:
             roles[an] = 2
     return roles
+
+
+def _positive_charged(res_name: str, atom_name: str) -> bool:
+    """Salt-bridge cation eligibility (atomworks charged-atom tables)."""
+    from atomworks.ml.transforms import interactions as _ia
+
+    return (res_name, atom_name) in _ia._POSITIVE_CHARGED_AA
+
+
+def _negative_charged(res_name: str, atom_name: str) -> bool:
+    """Salt-bridge anion eligibility (atomworks charged-atom tables)."""
+    from atomworks.ml.transforms import interactions as _ia
+
+    return (res_name, atom_name) in _ia._NEGATIVE_CHARGED
+
+
+def _aromatic_ring_atoms(res_name: str) -> frozenset[str]:
+    """Aromatic-ring atom names of one standard residue (empty for others)."""
+    from atomworks.ml.transforms import interactions as _ia
+
+    return frozenset(a for ring in _ia._AROMATIC_RINGS.get(res_name, ())
+                     for a in ring)
+
+
+def _warn_empty_selection(key: str, entry: str) -> None:
+    print(f"warning: {key} selection {entry!r} names no eligible atoms — skipped",
+          flush=True)
+
+
+def _interaction_payloads(inter_sel, motif_res, chain, motif_start: int) -> dict:
+    """Deferred payloads for the interaction-condition keys over a motif.
+
+    `motif_res` lists the motif residues in row order as (chain, res, mask37)
+    — conditioning lands on selected ∩ eligible ∩ materialized slots. Returns
+    {compiled channel name: (vals (rows, 37), where (rows, 37), motif_start)};
+    selections with no eligible atoms are warned and skipped."""
+    if not inter_sel:
+        return {}
+    from rfproteina.encoding import UNIFIED_ATOM37_ENCODING as ENC
+
+    payloads: dict[str, tuple] = {}
+    for key, res_map in inter_sel.items():
+        entries = [str(e) for e in chain[key]]
+        vals = np.zeros((len(motif_res), 37),
+                        dtype=bool if key == "pi_stack" else np.int32)
+        where = np.zeros((len(motif_res), 37), dtype=bool)
+        hit = False
+        for row, (name, res, mask37) in enumerate(motif_res):
+            res_map_c = res_map.get(name, {})
+            if "*" not in res_map_c and res.seqid.num not in res_map_c:
+                continue
+            atom_sel = res_map_c.get("*", res_map_c.get(res.seqid.num))
+            values = _interaction_residue_values(key, res, atom_sel,
+                                                 chain.get("ligands"))
+            for s, an in enumerate(
+                    str(nm).strip()
+                    for nm in ENC.token_atoms.get(res.name, ("",) * 37)):
+                if mask37[s] and an and an in values and (
+                        atom_sel is None or an in atom_sel):
+                    where[row, s] = True
+                    vals[row, s] = values[an]
+                    hit = True
+        if hit:
+            payloads[_INTERACTION_CHANNEL[key]] = (vals, where, motif_start)
+        else:
+            for entry in entries:
+                _warn_empty_selection(key, entry)
+    return payloads
+
+
+def _seq_interaction_values(key: str, res_name: str,
+                            atom_names: set[str]) -> dict[str, object]:
+    """Per-atom interaction values for one sequence-only residue's selected
+    atoms, from the atomworks tables (table-only: no coordinates)."""
+    if key == "h_bond":
+        return dict(_table_hbond_roles(res_name, atom_names))
+    if key == "salt_bridge":
+        out = {an: 1 for an in atom_names if _positive_charged(res_name, an)}
+        out.update({an: 2 for an in atom_names if _negative_charged(res_name, an)})
+        return out
+    if key == "pi_stack":
+        rings = _aromatic_ring_atoms(res_name)
+        return {an: True for an in atom_names if an in rings}
+    out: dict[str, object] = {}
+    rings = _aromatic_ring_atoms(res_name)
+    for an in atom_names:                       # pi_cation
+        if an in rings:
+            out[an] = 1                          # PiCationRole.AROMATIC
+        elif _positive_charged(res_name, an):
+            out[an] = 2                          # PiCationRole.CATION
+    return out
+
+
+def _interaction_residue_values(key: str, res, atom_sel, ligands) -> dict[str, object]:
+    """Eligible selected atoms of one structured residue -> per-atom values.
+
+    `atom_sel` None = whole residue. Standard vocabulary residues go through
+    the atomworks tables (h_bond via _residue_hbond_roles, which keeps the
+    coordinate-based H-donor fallback); HETATM residues through the RDKit
+    ligand heuristics (ligand_conditions.ligand_roles)."""
+    res_name = res.name.strip().upper()
+    names = [a.name.strip() for a in res
+             if atom_sel is None or a.name.strip() in atom_sel]
+    from rfproteina.encoding import UNIFIED_ATOM37_ENCODING as ENC
+
+    if res.name in ENC.token_atoms:
+        return _residue_hbond_roles(res, set(names)) if key == "h_bond" \
+            else _seq_interaction_values(key, res_name, set(names))
+    # HETATM: native ligand heuristics (RDKit), in file atom order
+    from .ligand_conditions import ligand_roles
+
+    elements, charges, bonds = _ligand_chemistry_from_residue(res, ligands)
+    from .spec import _atomic_number_from_symbol
+
+    elements = np.asarray([_atomic_number_from_symbol(e) for e in elements],
+                          np.int32)
+    roles = ligand_roles(elements, charges, bonds)
+    names = [a.name.strip() for a in res]
+    if key == "h_bond":
+        return {an: int(roles["hbond"][i]) for i, an in enumerate(names)
+                if roles["hbond"][i]}
+    if key == "salt_bridge":
+        return {an: int(roles["salt"][i]) for i, an in enumerate(names)
+                if roles["salt"][i]}
+    if key == "pi_stack":
+        return {an: True for i, an in enumerate(names) if roles["pistack"][i]}
+    out: dict[str, object] = {}
+    for i, an in enumerate(names):               # pi_cation
+        if roles["pistack"][i]:
+            out[an] = 1
+        elif roles["salt"][i] == 1:              # SALT_POSITIVE
+            out[an] = 2
+    return out
+
+
+def _parse_seq_selection(text: str, n: int) -> list[tuple[int, frozenset[str] | None]]:
+    """Parse a chain-prefix-free selection ("1,5,6-10", "2@NZ,OE1") into
+    0-based (residue, atom-names-or-None) pairs — the _parse_pdb_selection
+    grammar without the chain name (1-indexed, ranges inclusive; a
+    whole-residue entry wins over atom lists)."""
+    import re
+
+    out: dict[int, frozenset[str] | None] = {}
+    for part in text.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        m = re.fullmatch(r"(\d+)(?:-(\d+))?(?:@([\w,'\-]+))?", part)
+        if m is None:
+            raise ValueError(
+                f"from_chains: malformed selection entry {part!r} (expected "
+                "RES, RES-RES, with optional @ATOM,ATOM)")
+        lo, hi = int(m.group(1)), int(m.group(2) or m.group(1))
+        if not 1 <= lo <= hi <= n:
+            raise ValueError(
+                f"from_chains: selection entry {part!r} outside 1..{n}")
+        atoms = (frozenset(a.strip() for a in m.group(3).split(",") if a.strip())
+                 if m.group(3) else None)
+        for rn in range(lo - 1, hi):
+            prev = out.get(rn)
+            if prev is None:
+                out[rn] = atoms
+            elif atoms is not None:
+                out[rn] = prev | atoms
+    return sorted(out.items())
+
+
+def _resolve_pdb_bond_atom(entry: str, model, row_of, motif_res) -> tuple[int, int]:
+    """Resolve one pdb-grammar bond selector ("A48@NZ" — exactly one residue,
+    exactly one atom) to a (motif row, atom37 slot)."""
+    from rfproteina.encoding import UNIFIED_ATOM37_ENCODING as ENC
+
+    sel = _parse_pdb_selection([str(entry)], model)
+    if len(sel) != 1:
+        raise ValueError(
+            f"from_chains: bonds selector {entry!r} must name residues of "
+            "exactly one chain")
+    nm, res_map = next(iter(sel.items()))
+    if len(res_map) != 1 or "*" in res_map:
+        raise ValueError(
+            f"from_chains: bonds selector {entry!r} must name exactly one "
+            "residue (RES@ATOM)")
+    rn = next(iter(res_map))
+    atoms = res_map[rn]
+    if atoms is None or len(atoms) != 1:
+        raise ValueError(
+            f"from_chains: bonds selector {entry!r} must name exactly one "
+            "atom (RES@ATOM)")
+    key = (nm, int(rn))
+    if key not in row_of:
+        raise ValueError(
+            f"from_chains: bonds selector {entry!r} names a residue outside "
+            "the loaded motif")
+    row = row_of[key]
+    an = next(iter(atoms))
+    res = motif_res[row][1]
+    slots = [s for s, nm2 in enumerate(ENC.token_atoms.get(res.name, ("",) * 37))
+             if str(nm2).strip() == an]
+    if len(slots) != 1:
+        raise ValueError(
+            f"from_chains: bonds selector {entry!r} does not name exactly one "
+            f"atom of {res.name}")
+    return row, slots[0]
+
+
+def _pdb_bond_edges(chain: dict, model, motif_res, token_start: int) -> list[tuple]:
+    """Resolve the 'bonds'/'cyclic' keys of a pdb/cif dict into absolute-token
+    bond edges. 'bonds' selectors use the chain grammar with a required
+    single @ATOM (e.g. "A48@NZ"); 'cyclic': True closes each selected chain
+    head-to-tail (last C -> first N of the chain's motif rows)."""
+    if not (chain.get("bonds") or chain.get("cyclic")):
+        return []
+    row_of: dict[tuple[str, int], int] = {}
+    rows_by_chain: dict[str, list[int]] = {}
+    for row, (name, res, _mask) in enumerate(motif_res):
+        row_of[(name, int(res.seqid.num))] = row
+        rows_by_chain.setdefault(name, []).append(row)
+    edges: list[tuple] = []
+    entries = chain.get("bonds") or ()
+    if not isinstance(entries, (list, tuple)):
+        raise ValueError(
+            "from_chains: 'bonds' must be a list of "
+            "{'atoms': [selector, selector], 'order': 1|2|3} dicts")
+    for entry in entries:
+        atoms = entry.get("atoms") if isinstance(entry, dict) else None
+        order = entry.get("order", 1) if isinstance(entry, dict) else None
+        if (not isinstance(atoms, (list, tuple)) or len(atoms) != 2
+                or int(order) not in (1, 2, 3)):
+            raise ValueError(
+                "from_chains: each 'bonds' entry must be "
+                "{'atoms': [selector, selector], 'order': 1|2|3}")
+        (row_i, s_i), (row_j, s_j) = (
+            _resolve_pdb_bond_atom(a, model, row_of, motif_res) for a in atoms)
+        edges.append((token_start + row_i, s_i, token_start + row_j, s_j,
+                      int(order), False))
+    if chain.get("cyclic") is True:
+        for name, rows in rows_by_chain.items():
+            if len(rows) >= 2:
+                edges.append((token_start + rows[-1], 2,
+                              token_start + rows[0], 0, 1, True))
+    elif chain.get("cyclic") not in (False, None):
+        raise ValueError("from_chains: 'cyclic' must be True or False")
+    return edges
+
+
+def _interaction_sel(chain: dict, model, sel, names):
+    """Parse the optional interaction-condition keys ("h_bond", "salt_bridge",
+    "pi_stack", "pi_cation" — lists of selection strings) of a pdb/cif dict
+    into {key: {chain: {resnum: atom-set | None}}}, validating against the
+    loaded motif (out-of-motif chains/residues raise). None when no key is
+    present."""
+    parsed: dict[str, dict] = {}
+    for key in _INTERACTION_KEYS:
+        entries = chain.get(key)
+        if entries is None:
+            continue
+        if not isinstance(entries, (list, tuple)):
+            raise ValueError(
+                f"from_chains: {key!r} must be a list of selection strings")
+        parsed[key] = _parse_pdb_selection([str(e) for e in entries], model)
+    if not parsed:
+        return None
+    loaded = set(names)
+    motif: dict[str, set[int]] = {}
+    for nm, res_map in (sel or {}).items():
+        nums = {rn for rn in res_map if rn != "*"}
+        if "*" in res_map:
+            nums.update(res.seqid.num for res in model[nm]
+                        if res.name not in ("HOH", "DOD", "WAT"))
+        motif[nm] = nums
+    for key, res_map in parsed.items():
+        for nm, nums in res_map.items():
+            if nm not in loaded:
+                raise ValueError(
+                    f"from_chains: {key} selection names chain {nm!r}, which "
+                    f"is not part of the loaded motif")
+            if "*" not in nums:
+                bad = set(nums) - motif.get(nm, set())
+                if bad:
+                    raise ValueError(
+                        f"from_chains: {key} selection names residues {sorted(bad)} "
+                        f"of chain {nm!r}, which are not part of the loaded motif")
+    return parsed
 
 
 def _pdb_hotspot_sel(chain: dict, model, sel, names):
@@ -1562,6 +2481,12 @@ def _add_pdb_motifs(spec, chain: dict, residue_index_by_chain: dict) -> None:
     bb = _backbone_slots()
     drop_backbone = bool(chain.get("drop_backbone", False))
     sel = _apply_interface_selection(model, sel, names, chain)
+    sel = _apply_neighbour_selection(model, sel, names, chain)
+    inter_sel = _interaction_sel(chain, model, sel, names)
+    if inter_sel and chain.get("auto_condition"):
+        raise ValueError(
+            "from_chains: 'auto_condition' cannot be combined with explicit "
+            "interaction keys (h_bond/salt_bridge/pi_stack/pi_cation)")
     hotspot_sel = _pdb_hotspot_sel(chain, model, sel, names)
     auto_condition = bool(chain.get("auto_condition"))
     hotspot_where = np.zeros((0, 37), bool) if hotspot_sel is not None else None
@@ -1569,6 +2494,7 @@ def _add_pdb_motifs(spec, chain: dict, residue_index_by_chain: dict) -> None:
                   if auto_condition and hotspot_sel is not None else None)
 
     pos_rows, where_rows, restype_rows, ridx_by_new_chain = [], [], [], []
+    motif_res: list[tuple[str, object, np.ndarray]] = []
     # str-hotspot / auto_condition accumulators (indexed rows, filled below)
     n_motif_rows = 0
     for name in names:
@@ -1616,6 +2542,7 @@ def _add_pdb_motifs(spec, chain: dict, residue_index_by_chain: dict) -> None:
             if drop_backbone and not mask37.any():
                 continue  # nothing left after the backbone drop (e.g. GLY)
             motif_pos = n_motif_rows   # this residue's local motif index
+            motif_res.append((name, res, mask37))
             if hotspot_where is not None:
                 hotspot_where = np.vstack([
                     hotspot_where, np.zeros((1, 37), bool)])
@@ -1701,7 +2628,11 @@ def _add_pdb_motifs(spec, chain: dict, residue_index_by_chain: dict) -> None:
         hotspot_payload = (vals_arr, where_arr, motif_start)
     hbond_payload = None
     if auto_condition and hotspot_sel is not None and hbond_vals.any():
-        hbond_payload = (hbond_vals[:n_motif_rows], motif_start)
+        hbond_payload = (hbond_vals[:n_motif_rows], hbond_vals[:n_motif_rows] > 0,
+                         motif_start)
+    interaction_payloads = _interaction_payloads(inter_sel, motif_res, chain,
+                                                 motif_start)
+    bond_edges = _pdb_bond_edges(chain, model, motif_res, motif_start)
     if fixed:
         spec.add_indexed_motif(pos_sys, restype_sys, where_sys)
         # the spec path centers coordinates at compile time; the post-compile
@@ -1709,12 +2640,15 @@ def _add_pdb_motifs(spec, chain: dict, residue_index_by_chain: dict) -> None:
         # indexed/unindexed motifs share one frame (from_chains applies one
         # global centering over all conditioned atoms at the end)
         return {"hotspot": hotspot_payload, "hbond": hbond_payload,
+                **interaction_payloads,
+                "bond_edges": bond_edges,
                 "fixed_true": (pos_sys, where_sys, restype_sys)}
     # fixed=False: the internal-coordinate overlay needs the compiled input
     # (RFD4Input.add_indexed_motif supports fixed/group); the chains were
     # added as plain de-novo chains — the overlay is applied post-compile.
     return {"fixed_false": (pos_sys, where_sys, restype_sys, group),
-            "hotspot": hotspot_payload, "hbond": hbond_payload}
+            "hotspot": hotspot_payload, "hbond": hbond_payload,
+            **interaction_payloads, "bond_edges": bond_edges}
 
 
 
@@ -1837,6 +2771,46 @@ def _pad_batch(batch, coord_cond, pad_to: int):
     return new_batch, new_cc
 
 
+def _pad_input(inp: "RFD4Input", pad_to: int) -> "RFD4Input":
+    """Pad an ``RFD4Input`` directly to ``pad_to`` tokens without ``to_batch()`` roundtrip."""
+    import warnings
+
+    inp = inp._finalize_intcrd_groups() if inp._intcrd_sources else inp
+    n_real = int(inp.padding_mask.shape[1])
+    if pad_to <= n_real:
+        if pad_to < n_real:
+            warnings.warn(
+                f"pad_to={pad_to} is smaller than the compiled token count "
+                f"{n_real}; leaving the batch unpadded", stacklevel=2)
+        return inp
+    pad = pad_to - n_real
+    updates: dict[str, Array] = {}
+    for f in INPUT_FIELDS:
+        v = getattr(inp, f)
+        if v is None:
+            continue
+        arr = np.asarray(v)
+        if f == "padding_mask":
+            padded = np.concatenate([arr, np.zeros((1, pad), bool)], axis=1)
+        elif f in _PAD_PAIR:
+            padded = np.pad(arr, ((0, 0), (0, pad), (0, pad)))
+        else:
+            block_shape = (1, pad) + arr.shape[2:]
+            if f in _PAD_NEG1:
+                block = np.full(block_shape, -1, arr.dtype)
+            elif f in _PAD_NAN:
+                block = np.full(block_shape, np.nan, arr.dtype)
+            else:
+                block = np.zeros(block_shape, arr.dtype)
+            padded = np.concatenate([arr, block], axis=1)
+        updates[f] = jnp.asarray(padded)
+    if inp.coord_cond is not None:
+        cc = np.asarray(inp.coord_cond)
+        updates["coord_cond"] = jnp.asarray(
+            np.concatenate([cc, np.zeros((1, pad), bool)], axis=1))
+    return dataclasses.replace(inp, **updates)
+
+
 # ------------------------------------------------- unindexed motifs (BF13)
 def _unindexed_motif_kwargs(chain: dict) -> dict:
     """Extract add_unindexed_motif kwargs from an
@@ -1884,26 +2858,6 @@ def _unindexed_motif_kwargs(chain: dict) -> dict:
     return kwargs
 
 
-def _token_types_for(aa_arr: np.ndarray, atomized: np.ndarray) -> np.ndarray:
-    """Vocabulary-group token types for motif tokens (mirrors the compiled
-    direct featurizer: dna/rna/ncaa/glycan groups from the restype names,
-    atomized tokens → 3)."""
-    from rfproteina.encoding import RESIDUES_BY_TOKEN_TYPE as GROUPS
-    from rfproteina.encoding import UNIFIED_ATOM37_ENCODING as ENC
-
-    idx_to_tok = (ENC.idx_to_token if isinstance(ENC.idx_to_token, dict)
-                  else dict(enumerate(ENC.idx_to_token)))
-    tt = np.zeros(len(aa_arr), dtype=np.int32)
-    for group, tt_id in (("dna", 2), ("rna", 1), ("ncaa", 6), ("glycan", 5)):
-        gnames = {g.upper() for g in GROUPS[group]}
-        for t in range(len(aa_arr)):
-            name = str(idx_to_tok.get(int(aa_arr[t]), "")).upper()
-            if name in gnames:
-                tt[t] = tt_id
-    tt[atomized] = 3
-    return tt
-
-
 def _apply_seq_identity(sp, tokens, values):
     """One-hot identity rows in seq_probabilities (the trunk's C_SEQ feature).
 
@@ -1925,6 +2879,7 @@ def _apply_seq_identity(sp, tokens, values):
     return sp
 
 
+@lru_cache(maxsize=1)
 def _idx_to_token() -> dict:
     from rfproteina.encoding import UNIFIED_ATOM37_ENCODING as ENC
 
@@ -1940,20 +2895,32 @@ def _atomize_index() -> int:
     return int(ENC.token_to_idx["<A>"])
 
 
+@lru_cache(maxsize=1)
+def _vocab_token_type_table() -> np.ndarray:
+    """Cached (V+1,) token-type lookup indexed by vocabulary class id."""
+    from rfproteina.encoding import RESIDUES_BY_TOKEN_TYPE as GROUPS
+
+    idx_to_tok = _idx_to_token()
+    v_size = max(idx_to_tok) + 1 if idx_to_tok else 0
+    tbl = np.zeros(v_size + 1, dtype=np.int32)
+    group_of: dict[str, int] = {}
+    for group, tt_id in (("dna", 2), ("rna", 1), ("ncaa", 6), ("glycan", 5)):
+        for g in GROUPS[group]:
+            group_of[g.upper()] = tt_id
+    for idx, tok in idx_to_tok.items():
+        tbl[idx] = group_of.get(str(tok).upper(), 0)
+    return tbl
+
+
 def _token_types_for(aa_arr: np.ndarray, atomized: np.ndarray) -> np.ndarray:
     """Vocabulary-group token types for motif tokens (mirrors the compiled
     direct featurizer: dna/rna/ncaa/glycan groups from the restype names,
     atomized tokens -> 3)."""
-    from rfproteina.encoding import RESIDUES_BY_TOKEN_TYPE as GROUPS
-
-    idx_to_tok = _idx_to_token()
-    tt = np.zeros(len(aa_arr), dtype=np.int32)
-    for group, tt_id in (("dna", 2), ("rna", 1), ("ncaa", 6), ("glycan", 5)):
-        gnames = {g.upper() for g in GROUPS[group]}
-        for t in range(len(aa_arr)):
-            name = str(idx_to_tok.get(int(aa_arr[t]), "")).upper()
-            if name in gnames:
-                tt[t] = tt_id
+    tbl = _vocab_token_type_table()
+    sentinel = len(tbl) - 1
+    aa_i = np.asarray(aa_arr, dtype=np.int32)
+    safe = np.where((aa_i >= 0) & (aa_i < sentinel), aa_i, sentinel)
+    tt = tbl[safe].copy()
     tt[atomized] = 3
     return tt
 
@@ -2381,28 +3348,22 @@ def _append_motif_tokens(inp: "RFD4Input", pos: np.ndarray, aa: np.ndarray,
             inc[0, tb, 1, int(bt)] += 1
         # BFS hop counts within each ligand run (bond graph; cutoff None);
         # bond indices are ligand-local -> map through the motif-local tokens
-        adjacency = [set() for _ in range(m)]
-        for (i, j, order, arom) in chem["bonds"]:
-            mi, mj = int(lig_tok[i]), int(lig_tok[j])
-            adjacency[mi].add(mj)
-            adjacency[mj].add(mi)
-        for src in range(m):
-            if not is_ligand[src]:
-                continue
-            dist_m = np.full(m, -1, np.int32)
-            dist_m[src] = 0
-            frontier = [src]
-            d = 0
-            while frontier:
-                d += 1
-                nxt = []
-                for u in frontier:
-                    for v2 in adjacency[u]:
-                        if dist_m[v2] < 0:
-                            dist_m[v2] = d
-                            nxt.append(v2)
-                frontier = nxt
-            path[0, n + src, n:n + m] = np.maximum(dist_m, 0)
+        if len(chem["bonds"]):
+            from scipy.sparse import csr_matrix
+            from scipy.sparse.csgraph import shortest_path
+
+            bonds_arr = np.asarray(chem["bonds"], dtype=np.int32)
+            mi = lig_tok[bonds_arr[:, 0]]
+            mj = lig_tok[bonds_arr[:, 1]]
+            rows_g = np.concatenate([mi, mj])
+            cols_g = np.concatenate([mj, mi])
+            graph = csr_matrix(
+                (np.ones(len(rows_g), dtype=np.int8), (rows_g, cols_g)),
+                shape=(m, m),
+            )
+            sp = shortest_path(graph, directed=False, unweighted=True)
+            sp_int = np.where(np.isfinite(sp), sp, 0.0).astype(np.int32)
+            path[0, n + lig_tok, n:n + m] = sp_int[lig_tok]
 
     # coordinate conditioning per token: only the absolute route
     cc = (np.array(inp.coord_cond, copy=True) if inp.coord_cond is not None

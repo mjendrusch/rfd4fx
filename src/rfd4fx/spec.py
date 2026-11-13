@@ -23,6 +23,49 @@ CHAIN_KIND_TOKEN_TYPE = {"aa": 0, "rna": 1, "dna": 2}
 _ELEMENT_Z_CACHE: dict[str, int] = {}
 
 
+def sequence_to_names(seq: str, kind: str = "aa") -> list[str]:
+    """Parse a one-letter polymer string into 3-letter residue names.
+
+    `kind` selects the vocabulary: "aa" (protein), "dna", "rna". The
+    ambiguity code "X" (any kind) and "N" (dna/rna) are accepted as UNKNOWN
+    positions (atomworks maps them to the UNK/DN/N sentinels); any other
+    unresolvable letter raises ValueError."""
+    from atomworks.enums import ChainType
+    from atomworks.io.utils.sequence import get_3_from_1_letter_code
+
+    chain_types = {"aa": ChainType.POLYPEPTIDE_L, "dna": ChainType.DNA,
+                   "rna": ChainType.RNA}
+    ct = chain_types.get(kind)
+    if ct is None:
+        raise ValueError(
+            f"sequence: kind must be one of {sorted(chain_types)}, got {kind!r}")
+    valid = (set("ACDEFGHIKLMNPQRSTVWY") | {"X"} if kind == "aa"
+             else set("ACGT" if kind == "dna" else "ACGU") | {"N", "X"})
+    names = []
+    for ch1 in seq.upper():
+        if ch1 not in valid:
+            raise ValueError(f"sequence: unknown {kind} letter {ch1!r}")
+        names.append(str(get_3_from_1_letter_code(ch1, ct)))
+    return names
+
+
+# atomworks' sentinel names for ambiguous letters — treated as "unknown":
+# C_SEQ is left unset (the residue is designed) and they have no sidechain
+_AMBIGUOUS_NAMES = frozenset({"UNK", "DN", "N"})
+
+
+def sequence_to_indices(seq: str, kind: str = "aa") -> np.ndarray:
+    """One-letter polymer string -> int32 array of RFD4 encoding indices.
+
+    Ambiguous letters (X for aa; N/X for dna/rna) map to 0 = <M> = unset
+    C_SEQ at that position."""
+    from rfproteina.encoding import UNIFIED_ATOM37_ENCODING as ENC
+
+    return np.array([0 if name in _AMBIGUOUS_NAMES
+                     else ENC.token_to_idx.get(name, 0)
+                     for name in sequence_to_names(seq, kind)], dtype=np.int32)
+
+
 def parse_dot_bracket(dot_bracket: str) -> tuple[np.ndarray, list[tuple[int, int]]]:
     """Parse a dot-bracket string into per-position NA-SS states + base pairs.
 
@@ -472,8 +515,9 @@ class RFD4Spec:
     def add_sequence(self, values, *, chain: int | None = None) -> None:
         """Per-residue sequence conditioning (C_SEQ) on de-novo chains.
 
-        `values` is a one-letter amino-acid string (one character per residue,
-        e.g. "AGLST") or an int32 array of RFD4 encoding indices. This fixes the
+        `values` is a one-letter polymer string (one character per residue,
+        e.g. "AGLST"; DNA/RNA chains use their own 1-letter codes — A/C/G/T
+        and A/C/G/U) or an int32 array of RFD4 encoding indices. This fixes the
         identity of the targeted residues inside the designed chain — a capability
         the sentinel-CIF route cannot express (its expseg row carries one C_SEQ for
         the whole segment), so it compiles through the direct featurizer only and
@@ -486,16 +530,7 @@ class RFD4Spec:
         for ci, vals in targets:
             ch = self.chains[ci]
             if isinstance(vals, str):
-                from atomworks.enums import ChainType
-                from atomworks.io.utils.sequence import get_3_from_1_letter_code
-                from rfproteina.encoding import UNIFIED_ATOM37_ENCODING as ENC
-                idxs = []
-                for ch1 in vals:
-                    three = get_3_from_1_letter_code(ch1, ChainType.POLYPEPTIDE_L)
-                    if three is None:
-                        raise ValueError(f"add_sequence: unknown amino-acid letter {ch1!r}")
-                    idxs.append(ENC.token_to_idx.get(three, 0))
-                vals = np.array(idxs, dtype=np.int32)
+                vals = sequence_to_indices(vals, ch.kind)
             vals = np.asarray(vals, dtype=np.int32)
             if vals.shape != (ch.num_residues,):
                 raise ValueError(
@@ -1366,6 +1401,12 @@ _chem_comp_atom.pdbx_model_Cartn_z_ideal
                                      np.zeros((1, n_total, 37), bool))
                 ch[0, lo:lo + k, 1] = pistack
                 host["condition_pistack_1_atom"] = ch
+                pication = lig.interactions.get("pication")
+                if pication is not None:
+                    ch = host.setdefault("condition_pication_1_atom",
+                                         np.zeros((1, n_total, 37), np.int32))
+                    ch[0, lo:lo + k, 1] = np.asarray(pication, np.int32)
+                    host["condition_pication_1_atom"] = ch
             if lig.buried:
                 ch = host.setdefault("condition_rasa-binned_1_atom",
                                      np.zeros((1, n_total, 37), np.int32))
@@ -1392,9 +1433,11 @@ _chem_comp_atom.pdbx_model_Cartn_z_ideal
                 k = lig_sizes[li]
                 if k == 0 or len(lig.bonds) == 0:
                     continue
+                from scipy.sparse import csr_matrix
+                from scipy.sparse.csgraph import shortest_path
+
                 bi = lig.bonds[:, 0]
                 bj = lig.bonds[:, 1]
-                adjacency = [set() for _ in range(k)]
                 for a, b, bt, ar in zip(bi, bj, lig.bonds[:, 2], lig.bonds[:, 3]):
                     ta, tb = lo + int(a), lo + int(b)
                     bond_mask[ta, tb] = bond_mask[tb, ta] = True
@@ -1403,24 +1446,14 @@ _chem_comp_atom.pdbx_model_Cartn_z_ideal
                         is_aromatic[ta, tb] = is_aromatic[tb, ta] = True
                     incident[ta, 1, int(bt)] += 1
                     incident[tb, 1, int(bt)] += 1
-                    adjacency[a].add(b)
-                    adjacency[b].add(a)
-                # BFS hop counts (cutoff None) over the ligand graph
-                for src in range(k):
-                    dist = np.full(k, -1, np.int32)
-                    dist[src] = 0
-                    frontier = [src]
-                    d = 0
-                    while frontier:
-                        d += 1
-                        nxt = []
-                        for u in frontier:
-                            for v in adjacency[u]:
-                                if dist[v] < 0:
-                                    dist[v] = d
-                                    nxt.append(v)
-                        frontier = nxt
-                    path[lo + src, lo:lo + k] = np.maximum(dist, 0)
+                rows_g = np.concatenate([bi, bj])
+                cols_g = np.concatenate([bj, bi])
+                graph = csr_matrix(
+                    (np.ones(len(rows_g), dtype=np.int8), (rows_g, cols_g)),
+                    shape=(k, k),
+                )
+                sp = shortest_path(graph, directed=False, unweighted=True)
+                path[lo:lo + k, lo:lo + k] = np.where(np.isfinite(sp), sp, 0.0).astype(np.int32)
             host["bond_mask"] = bond_mask[None]
             host["bond_order"] = bond_order[None]
             host["is_aromatic"] = is_aromatic[None]

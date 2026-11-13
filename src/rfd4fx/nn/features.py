@@ -54,10 +54,16 @@ def bin_and_one_hot(tensor: Float[Array, "..."], bin_limits: Float[Array, " l"])
     return jax.nn.one_hot(bin_indices, len(bin_limits) + 1)
 
 
+def _pairwise_dist_bins(x: Float[Array, "b n 3"], min_dist: float, max_dist: float, dim: int):
+    """Bin pairwise Euclidean distances via squared thresholds (avoids sqrt and d=0 grad singularity)."""
+    diff = x[:, :, None, :] - x[:, None, :, :]
+    d2 = jnp.sum(jnp.square(diff), axis=-1)
+    sq_limits = jnp.square(jnp.linspace(min_dist, max_dist, dim - 1))
+    return jnp.searchsorted(sq_limits, d2, side="left")
+
+
 def bin_pairwise_distances(x: Float[Array, "b n 3"], min_dist: float, max_dist: float, dim: int):
-    pair_dists = jnp.linalg.norm(x[:, :, None, :] - x[:, None, :, :], axis=-1)
-    bin_limits = jnp.linspace(min_dist, max_dist, dim - 1)
-    return bin_and_one_hot(pair_dists, bin_limits)
+    return jax.nn.one_hot(_pairwise_dist_bins(x, min_dist, max_dist, dim), dim)
 
 
 def embed_charge(embedding: Embedding, charges: Int[Array, "..."]) -> Float[Array, "... d"]:
@@ -154,10 +160,11 @@ class Atom37NanometersCoorsSeqFeat(eqx.Module):
     rel: bool = False
 
     def __call__(self, batch: FlowBatch, *, key=None):
-        coors = batch.coords_nm * batch.atom37_mask[..., None]
+        mask_e = batch.atom37_mask[..., None]
+        coors = jnp.where(mask_e, batch.coords_nm, 0.0)
         if self.rel:
             ca = coors[:, :, 1, :]
-            coors = (coors - ca[:, :, None, :]) * batch.atom37_mask[..., None]
+            coors = jnp.where(mask_e, coors - ca[:, :, None, :], 0.0)
         coors_flat = coors.reshape(*coors.shape[:-2], -1)
         return jnp.concatenate([coors_flat, batch.atom37_mask.astype(jnp.float32)], axis=-1)
 
@@ -240,9 +247,10 @@ class CoordGroupSeqFeat(eqx.Module):
         assert key is not None, "CoordGroupSeqFeat requires an RNG key"
         cg = batch.coord_groups.astype(jnp.int32)
         non_padding = cg != _CRDGRP_UNKNOWN
-        ids = jnp.arange(self.max_group_id + 1)
         # present[v] = does group id v occur anywhere in the batch (torch.unique semantics)
-        present = jnp.any(cg[..., None] == ids, axis=(0, 1, 2))
+        in_range = (cg >= 0) & (cg <= self.max_group_id)
+        safe_cg = jnp.where(in_range, cg, 0)
+        present = jnp.zeros(self.max_group_id + 1, dtype=jnp.bool_).at[safe_cg].max(in_range)
         # Random bijection present-ids -> {0..P-1}: sort present ids by a random
         # key, absent ids get +inf and sort last; rank = argsort(argsort(keys)).
         keys = jnp.where(present, jax.random.uniform(key, (self.max_group_id + 1,)), jnp.inf)
@@ -428,8 +436,8 @@ class IncidentBondTypeCountsSeqFeat(eqx.Module):
     dim: int = 37 * 10
 
     def __call__(self, batch: FlowBatch, *, key=None):
-        counts = batch.incident_bond_type_counts.astype(jnp.float32)
-        return (counts * batch.atom37_mask[..., None]).reshape(*counts.shape[:-2], -1)
+        counts = jnp.where(batch.atom37_mask[..., None], batch.incident_bond_type_counts.astype(jnp.float32), 0.0)
+        return counts.reshape(*counts.shape[:-2], -1)
 
 
 class FoldEmbeddingSeqFeat(AbstractFromTorch):
@@ -439,6 +447,9 @@ class FoldEmbeddingSeqFeat(AbstractFromTorch):
     dim: int = 96
 
     def __call__(self, batch: FlowBatch, *, key=None):
+        if batch.cath_codes is None:
+            b, n = batch.padding_mask.shape
+            return jnp.zeros((b, n, self.dim))
         # torch: cath_codes + 1 because padding/null are -1.
         cath = batch.cath_codes.astype(jnp.int32) + 1
         return jnp.concatenate(
@@ -481,26 +492,27 @@ class CaCoorsNanometersPairwiseDistancesPairFeat(eqx.Module):
 class BackbonePairDistancesNanometerPairFeat(eqx.Module):
     dim: int = 84
 
-    def __call__(self, batch: FlowBatch, *, key=None):
+    def _bin_indices(self, batch: FlowBatch):
         coords = batch.coords_nm
         atom_mask = batch.atom37_mask
         mask = atom_mask[:, :, 1]  # CA present
-        pair_mask = mask[:, None, :] * mask[:, :, None]
+        pair_mask = mask[:, None, :] & mask[:, :, None]
         has_cb = atom_mask[:, :, 3]
+        ca_i = coords[:, :, 1:2, :]
+        sq_limits = jnp.square(jnp.linspace(0.1, 2.0, 20))
+        bins = []
+        for slot in range(4):
+            diff = ca_i - coords[:, None, :, slot, :]
+            d2 = jnp.sum(jnp.square(diff), axis=-1)
+            valid = (pair_mask & has_cb[:, None, :]) if slot == 3 else pair_mask
+            d2 = jnp.where(valid, d2, 0.0)
+            bins.append(jnp.searchsorted(sq_limits, d2, side="left"))
+        return bins, pair_mask
 
-        N, CA, C, CB = (coords[:, :, i, :] for i in range(4))
-        CA_i = CA[:, :, None, :]
-        ca_n, ca_ca, ca_c, ca_cb = (
-            jnp.linalg.norm(CA_i - v[:, None, :, :], axis=-1) for v in (N, CA, C, CB)
-        )
-        # Glycine etc. have no CB: zero those distances (torch broadcasts has_cb
-        # as [b, 1, n] — the j-in-axis mask).
-        ca_cb = ca_cb * has_cb[:, None, :]
-        ca_n, ca_ca, ca_c, ca_cb = (v * pair_mask for v in (ca_n, ca_ca, ca_c, ca_cb))
-        bin_limits = jnp.linspace(0.1, 2.0, 20)
-        feats = [bin_and_one_hot(v, bin_limits) for v in (ca_n, ca_ca, ca_c, ca_cb)]
-        feat = jnp.concatenate(feats, axis=-1)
-        return feat * pair_mask[..., None]
+    def __call__(self, batch: FlowBatch, *, key=None):
+        bins, pair_mask = self._bin_indices(batch)
+        feat = jnp.concatenate([jax.nn.one_hot(b_idx, 21) for b_idx in bins], axis=-1)
+        return jnp.where(pair_mask[..., None], feat, 0.0)
 
 
 class MoleculeIdxPairFeat(eqx.Module):

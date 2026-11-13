@@ -318,7 +318,11 @@ def _build_bonds(atoms: dict, ccd_entries: dict,
             _link_cache[key] = (leaving or "", entering or "")
         return _link_cache[key]
 
-    order_keys = sorted(residue_atoms.keys(), key=lambda k: (chains.index(k[0]) if isinstance(chains, list) else 0, k[1]))
+    chain_first_idx: dict = {}
+    if isinstance(chains, list):
+        for idx_c, ch_c in enumerate(chains):
+            chain_first_idx.setdefault(ch_c, idx_c)
+    order_keys = sorted(residue_atoms.keys(), key=lambda k: (chain_first_idx.get(k[0], 0), k[1]))
     for (c1, r1), (c2, r2) in zip(order_keys[:-1], order_keys[1:]):
         if c1 != c2 or r2 != r1 + 1:
             continue
@@ -408,7 +412,8 @@ def _kabsch_rotation(source: np.ndarray, target: np.ndarray) -> np.ndarray:
     tgt = np.asarray(target, np.float64)
     h = src.T @ tgt
     u, _s, vt = np.linalg.svd(h)
-    d = np.eye(3) * np.sign(np.linalg.det(vt.T @ u.T))
+    det_s = float(np.sign(np.linalg.det(vt.T @ u.T)))
+    d = np.eye(3) * (1.0 if det_s == 0.0 else det_s)
     r = (vt.T @ d @ u.T).astype(np.float64)
     return r
 
@@ -790,12 +795,11 @@ def annotated_cif_to_batch_numpy(
             if not run_keys or run_keys[-1] != key:
                 run_keys.append(key)
             tok_of_run[i] = len(run_keys) - 1
-        run_starts = np.array([np.flatnonzero(tok_of_run == t)[0] for t in range(len(run_keys))])
+        _, run_starts = np.unique(tok_of_run, return_index=True)
         tok_indexed = indexed_atom[run_starts]
-        for t in range(len(run_keys)):
-            if not (indexed_atom[tok_of_run == t] == tok_indexed[t]).all():
-                raise ValueError(
-                    "C_IDX must be uniform across every token; unindexed polymer tokens are full residues.")
+        if not np.array_equal(indexed_atom, tok_indexed[tok_of_run]):
+            raise ValueError(
+                "C_IDX must be uniform across every token; unindexed polymer tokens are full residues.")
         # effective index groups: authored values where present (>=0), else the
         # condition system's per-chain default (chain rank)
         chain_rank_a = {c: i for i, c in enumerate(sorted(dict.fromkeys(chains)))}
@@ -885,7 +889,7 @@ def annotated_cif_to_batch_numpy(
             token_keys.append(key if not atomize_atom[i] else (key[0], key[1], i))
         token_of_atom[i] = len(token_keys) - 1
     n_tokens = len(token_keys)
-    token_starts = np.array([np.flatnonzero(token_of_atom == t)[0] for t in range(n_tokens)])
+    _, token_starts = np.unique(token_of_atom, return_index=True)
     atomize_tok = atomize_atom[token_starts]
     token_type_tok = token_type_atom[token_starts]
     res_names_tok = res_names_arr[token_starts]
@@ -1127,11 +1131,8 @@ def annotated_cif_to_batch_numpy(
                 if v in (".", "?"):
                     continue
                 arr[i, slot] = (v == "True") if col_name in bool_conds else int(float(v))
-            tok_arr = np.zeros((n_tokens, 37), dtype=arr.dtype)
-            for t in range(n_tokens):
-                lo = token_starts[t]
-                hi = token_starts[t] + int((token_of_atom == t).sum())
-                tok_arr[t] = arr[lo:hi].max(axis=0) if hi > lo else arr[lo]
+            tok_arr = (np.maximum.reduceat(arr, token_starts, axis=0)
+                       if n_tokens > 0 else np.zeros((0, 37), dtype=arr.dtype))
             host[col_name] = tok_arr[None]
         elif col_name == "condition_sequence_1_residue":
             from rfproteina.encoding import UNIFIED_ATOM37_ENCODING as ENC  # numpy-only
@@ -1227,9 +1228,8 @@ def annotated_cif_to_batch_numpy(
         # formal charges are authored per-atom in the CIF (pdbx_formal_charge)
         if formal_charge[i] not in (".", "?", ""):
             charge37[t, s] = int(float(formal_charge[i]))
-    coord_cond_mask = np.array([
-        bool(cond_atom[token_starts[t]:token_starts[t] + int((token_of_atom == t).sum())].any())
-        for t in range(n_tokens)])
+    coord_cond_mask = (np.logical_or.reduceat(cond_atom, token_starts)
+                       if n_tokens > 0 else np.zeros(0, dtype=bool))
     host["atom37_mask"] = atom37_mask[None]
     host["element"] = element37[None]
     host["ground_truth_element"] = gt_element37[None]
@@ -1244,15 +1244,14 @@ def annotated_cif_to_batch_numpy(
         atoms_e = bonds[:, endpoint]
         bt_e = bonds[:, 2]
         valid = has_slot[atoms_e]
-        for ai, bt in zip(atoms_e[valid], bt_e[valid]):
-            incident[token_of_atom[ai], slot_of_atom[ai], bt] += 1
+        ai_v = atoms_e[valid]
+        np.add.at(incident, (token_of_atom[ai_v], slot_of_atom[ai_v], bt_e[valid]), 1)
     host["incident_bond_type_counts"] = incident[None]
 
     # coordinates: real atoms in slots; stubs zero (masked rows carry NaN coords → 0)
     coords37 = np.zeros((n_tokens, 37, 3), np.float32)
-    for i in range(n):
-        if has_slot[i] and np.isfinite(atoms["coords"][i]).all():
-            coords37[token_of_atom[i], slot_of_atom[i]] = atoms["coords"][i]
+    valid_coords = has_slot & np.isfinite(atoms["coords"]).all(axis=-1)
+    coords37[token_of_atom[valid_coords], slot_of_atom[valid_coords]] = atoms["coords"][valid_coords]
     host["coords"] = coords37[None]  # Å; assembler converts to nm
 
     # ---- token bond features (bonds.py semantics)
@@ -1344,26 +1343,20 @@ def annotated_cif_to_batch_numpy(
             host["is_aromatic"][0, a, b] = host["is_aromatic"][0, b, a] = True
 
     # BFS path lengths over the full inter-token graph (cutoff None)
-    adjacency: list[set[int]] = [set() for _ in range(n_tokens)]
-    for a, b, _t, _ar in zip(lo, hi, et, ear):
-        adjacency[a].add(b)
-        adjacency[b].add(a)
-    path = np.zeros((n_tokens, n_tokens), np.int32)
-    for src in range(n_tokens):
-        dist = np.full(n_tokens, -1, np.int32)
-        dist[src] = 0
-        frontier = [src]
-        d = 0
-        while frontier:
-            d += 1
-            nxt = []
-            for u in frontier:
-                for v in adjacency[u]:
-                    if dist[v] < 0:
-                        dist[v] = d
-                        nxt.append(v)
-            frontier = nxt
-        path[src] = np.maximum(dist, 0)
+    if n_tokens > 0 and len(lo):
+        from scipy.sparse import csr_matrix
+        from scipy.sparse.csgraph import shortest_path
+
+        rows_g = np.concatenate([lo, hi])
+        cols_g = np.concatenate([hi, lo])
+        graph = csr_matrix(
+            (np.ones(len(rows_g), dtype=np.int8), (rows_g, cols_g)),
+            shape=(n_tokens, n_tokens),
+        )
+        sp = shortest_path(graph, directed=False, unweighted=True)
+        path = np.where(np.isfinite(sp), sp, 0.0).astype(np.int32)
+    else:
+        path = np.zeros((n_tokens, n_tokens), np.int32)
     # paths across IndexGroups are unknown relative positions -> 0 (bonds.py)
     idx_group = np.asarray(host["condition_index-group_1_token"])[0]
     if np.unique(idx_group).size > 1:

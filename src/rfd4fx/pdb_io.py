@@ -5,10 +5,43 @@ multi-residue nucleic-acid chains."""
 
 from __future__ import annotations
 
+import functools
+
 import numpy as np
 
 _PROTEIN_TOKEN_TYPES = (0,)
 _NA_TOKEN_TYPES = (1, 2)  # rna, dna (rfproteina TOKEN_TYPE_IDS)
+_TWO_CHAR_ELEMS = frozenset(("CL", "BR", "SE", "MG", "ZN", "FE"))
+
+
+@functools.lru_cache(maxsize=1)
+def _atom37_vocab_tables():
+    """Precompute (V+1, 37) atom-name / element lookup tables from UNIFIED_ATOM37_ENCODING."""
+    from atomworks.ml.encoding_definitions import UNIFIED_ATOM37_ENCODING as enc
+
+    idx_to_tok = (enc.idx_to_token if isinstance(enc.idx_to_token, dict)
+                  else dict(enumerate(enc.idx_to_token)))
+    v_size = max(idx_to_tok) + 1 if idx_to_tok else 0
+    vocab_names = np.full(v_size + 1, "", dtype="U8")
+    slot_names = np.full((v_size + 1, 37), "", dtype="U6")
+    slot_elems = np.full((v_size + 1, 37), "", dtype="U4")
+    tok_to_idx: dict[str, int] = {}
+
+    for idx, tok in idx_to_tok.items():
+        res_name = str(tok)
+        vocab_names[idx] = res_name
+        tok_to_idx[res_name] = idx
+        atoms = enc.token_atoms.get(res_name)
+        if atoms is None:
+            continue
+        for s in range(37):
+            an = str(atoms[s]).strip()
+            if not an:
+                continue
+            slot_names[idx, s] = an
+            letters = "".join(c for c in an if c.isalpha()).upper()
+            slot_elems[idx, s] = letters[:2] if letters[:2] in _TWO_CHAR_ELEMS else letters[:1]
+    return vocab_names, slot_names, slot_elems, tok_to_idx
 
 
 def _chain_assignments(token_type: np.ndarray, real: np.ndarray,
@@ -83,11 +116,9 @@ def decoded_to_atom_array(dec, batch=None, *, aa_pred=None,
         always kept).
     """
     import biotite.structure as bs
-    from atomworks.ml.encoding_definitions import UNIFIED_ATOM37_ENCODING
 
-    enc = UNIFIED_ATOM37_ENCODING
-    idx_to_tok = (enc.idx_to_token if isinstance(enc.idx_to_token, dict)
-                  else dict(enumerate(enc.idx_to_token)))
+    vocab_names, slot_names_tbl, slot_elems_tbl, tok_to_idx = _atom37_vocab_tables()
+    sentinel = vocab_names.shape[0] - 1
 
     coors = np.asarray(dec.coors_nm)[0] * 10.0          # nm -> Å
     emit = np.asarray(dec.emit_mask)[0]
@@ -98,39 +129,36 @@ def decoded_to_atom_array(dec, batch=None, *, aa_pred=None,
     token_type = (np.asarray(batch.token_type)[0] if batch is not None
                   else np.zeros(n, np.int32))
     if identity is not None:
-        names = np.asarray(identity).astype(str)
+        res_names = np.asarray(identity).astype(str)
+        v_idx = np.fromiter(
+            (tok_to_idx.get(str(nm), sentinel) for nm in res_names),
+            dtype=np.int32, count=n,
+        )
     else:
         src = (np.asarray(aa_pred)[0] if aa_pred is not None and np.asarray(aa_pred).ndim == 2
                else (np.asarray(aa_pred) if aa_pred is not None
-                     else np.asarray(dec.aatype_max)[0]))
-        names = np.array([str(idx_to_tok.get(int(v), ""))
-                          for v in src], dtype=object)
+                     else np.asarray(dec.aatype_max)[0])).astype(np.int32)
+        v_idx = np.where((src >= 0) & (src < sentinel), src, sentinel)
+        res_names = vocab_names[v_idx]
     chain_of = _chain_assignments(token_type, real, chain_ids)
 
-    arr = bs.AtomArray(0)
-    for t in range(n):
-        if not real[t] or not emit[t]:
-            continue
-        res_name = str(names[t])
-        slot_names = enc.token_atoms.get(res_name)
-        if slot_names is None:
-            continue
-        for s in range(37):
-            an = str(slot_names[s]).strip()
-            xyz = coors[t, s]
-            if (not an or not gate[t, s] or not np.isfinite(xyz).all()
-                    or np.abs(xyz).sum() == 0):
-                continue
-            atom = bs.AtomArray(1)
-            atom.coord[0] = xyz
-            atom.chain_id[0] = chain_of[t]
-            atom.res_id[0] = t + 1
-            atom.res_name[0] = res_name
-            atom.atom_name[0] = an
-            letters = "".join(c for c in an if c.isalpha()).upper()
-            atom.element[0] = (letters[:2] if letters[:2] in ("CL", "BR", "SE", "MG", "ZN", "FE")
-                               else letters[:1])
-            arr += atom
+    an_grid = slot_names_tbl[v_idx]
+    valid_slot = (
+        (real & emit)[:, None]
+        & gate
+        & (an_grid != "")
+        & np.isfinite(coors).all(axis=-1)
+        & (np.abs(coors).sum(axis=-1) > 0)
+    )
+    tok_idx, slot_idx = np.nonzero(valid_slot)
+    arr = bs.AtomArray(len(tok_idx))
+    if len(tok_idx):
+        arr.coord[:] = coors[tok_idx, slot_idx]
+        arr.chain_id[:] = chain_of[tok_idx]
+        arr.res_id[:] = tok_idx + 1
+        arr.res_name[:] = res_names[tok_idx]
+        arr.atom_name[:] = an_grid[tok_idx, slot_idx]
+        arr.element[:] = slot_elems_tbl[v_idx[tok_idx], slot_idx]
 
     # native terminal-oxygen cleanup: per chain, multi-residue only; kind
     # from the compiled token_type (na if any rna/dna token, else protein)

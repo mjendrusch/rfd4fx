@@ -15,10 +15,11 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from .flow_matching import (RFD4Result, THINKING_HIGH, _mask, _set_x_t,
-                            compute_tsr_ratio, get_gt, get_schedule,
-                            get_schedule_tsr_safe, guided_velocity,
-                            predict_x1_from_v, sample_noise, simulation_step)
+from .flow_matching import (RFD4Result, THINKING_HIGH, _decode_predictions,
+                            _mask, _set_x_t, compute_tsr_ratio, get_gt,
+                            get_schedule, get_schedule_tsr_safe,
+                            guided_velocity, predict_x1_from_v, sample_noise,
+                            simulation_step)
 from .types import FlowBatch
 
 
@@ -97,7 +98,7 @@ def stack_results(results: list[RFD4Result]) -> RFD4Result:
         first = leaves[0]
         if hasattr(first, "shape") and getattr(first, "ndim", 0) >= 1 \
                 and int(first.shape[0]) == 1:
-            return jnp.stack([np.asarray(l) for l in leaves], axis=0)
+            return jnp.stack(leaves, axis=0)
         return first
 
     return jax.tree.map(merge, *results)
@@ -158,7 +159,7 @@ def _stack_results(pairs: list[tuple[RFD4Result, list[int]]]) -> RFD4Result:
         for leaf, (_g, k) in zip(leaves, gathered):
             if hasattr(leaf, "shape") and getattr(leaf, "ndim", 0) >= 1 \
                     and int(leaf.shape[0]) == k:
-                parts.append(np.asarray(leaf))
+                parts.append(leaf)
             elif static is None:
                 static = leaf
         if parts:
@@ -374,6 +375,7 @@ class RFD4Search(eqx.Module):
     sampler_args: dict
     guidance_w: float
     _step: Callable
+    _decode_fn: Callable
 
     def __init__(self, step, model, evaluate: Callable, *,
                  batch_evaluate: Callable | None = None,
@@ -420,6 +422,8 @@ class RFD4Search(eqx.Module):
         self.sampler_args = sampler_args
         self.guidance_w = guidance_w
         self._step = eqx.filter_jit(step) if jit_step else step
+        self._decode_fn = (eqx.filter_jit(_decode_predictions)
+                           if jit_step else _decode_predictions)
 
     # ----------------------------------------------------------- schedules
     def _schedules(self, nsteps: int):
@@ -462,18 +466,23 @@ class RFD4Search(eqx.Module):
         from .nn.transformer import compute_flow_emit_masks
 
         emit_masks = compute_flow_emit_masks(batch)  # match the batch's batch dim
+        bsz = batch.padding_mask.shape[0]
+        ts_np = {dm: np.asarray(v, dtype=np.float32) for dm, v in ts.items()}
+        gts_np = {dm: np.asarray(v, dtype=np.float32) for dm, v in gts.items()}
         x = dict(x)
         x_1_last = None
         for step_i in range(start, end):
             k_model, k_bb, k_lat, key = jax.random.split(key, 4)
-            t_bb = ts["bb_ca"][step_i] * jnp.ones(batch.padding_mask.shape[0])
-            t_lat = ts["local_latents"][step_i] * jnp.ones(batch.padding_mask.shape[0])
+            t_bb_s = jnp.asarray(ts_np["bb_ca"][step_i], dtype=jnp.float32)
+            t_lat_s = jnp.asarray(ts_np["local_latents"][step_i], dtype=jnp.float32)
+            t_bb = jnp.full((bsz,), ts_np["bb_ca"][step_i], dtype=jnp.float32)
+            t_lat = jnp.full((bsz,), ts_np["local_latents"][step_i], dtype=jnp.float32)
             batch = _set_x_t(batch, x["bb_ca"], x["local_latents"], t_bb, t_lat)
             batch = eqx.tree_at(lambda d: d.n_recycle, batch,
                                 jnp.asarray(depths[step_i], dtype=jnp.int32),
                                 is_leaf=lambda l: l is None)
-            out = self._step(self.model, k_model, batch)
-            v = dict(out.v_pred)
+            batch = self._step(self.model, k_model, batch)
+            v = dict(batch.v_pred)
             if self.guidance_w != 1.0 and self.matcher_cfgs["bb_ca"].guidance_enabled:
                 ucond = eqx.tree_at(lambda b_: b_.cath_codes, batch, None,
                                     is_leaf=lambda l: l is None)
@@ -485,33 +494,29 @@ class RFD4Search(eqx.Module):
             else:
                 v = {dm: guided_velocity(v[dm], None, 1.0, False) for dm in v}
             x_1_last = {
-                "bb_ca": _mask(predict_x1_from_v(x["bb_ca"], v["bb_ca"],
-                                                 ts["bb_ca"][step_i]),
+                "bb_ca": _mask(predict_x1_from_v(x["bb_ca"], v["bb_ca"], t_bb_s),
                                emit_masks["bb_ca"]),
                 "local_latents": _mask(
-                    predict_x1_from_v(x["local_latents"], v["local_latents"],
-                                      ts["local_latents"][step_i]),
+                    predict_x1_from_v(x["local_latents"], v["local_latents"], t_lat_s),
                     emit_masks["local_latents"]),
             }
             k_bb, k_lat, key = jax.random.split(key, 3)
             x["bb_ca"] = simulation_step(
-                x["bb_ca"], v["bb_ca"], ts["bb_ca"][step_i],
-                float(ts["bb_ca"][step_i + 1] - ts["bb_ca"][step_i]),
-                float(gts["bb_ca"][step_i]), emit_masks["bb_ca"],
+                x["bb_ca"], v["bb_ca"], t_bb_s,
+                float(ts_np["bb_ca"][step_i + 1] - ts_np["bb_ca"][step_i]),
+                float(gts_np["bb_ca"][step_i]), emit_masks["bb_ca"],
                 self.step_params["bb_ca"], key=k_bb)
             x["local_latents"] = simulation_step(
-                x["local_latents"], v["local_latents"], ts["local_latents"][step_i],
-                float(ts["local_latents"][step_i + 1] - ts["local_latents"][step_i]),
-                float(gts["local_latents"][step_i]), emit_masks["local_latents"],
+                x["local_latents"], v["local_latents"], t_lat_s,
+                float(ts_np["local_latents"][step_i + 1] - ts_np["local_latents"][step_i]),
+                float(gts_np["local_latents"][step_i]), emit_masks["local_latents"],
                 self.step_params["local_latents"], key=k_lat)
         return x, x_1_last, batch
 
     def _decode(self, batch, x_1) -> RFD4Result:
         """AE-decode clean predictions into a batched RFD4Result."""
-        decode_fn = eqx.filter_jit(
-            lambda m, d: m.decode(d, x_1["bb_ca"], x_1["local_latents"],
-                                  aa_pred=d.aa_pred))
-        dec = decode_fn(self.model, batch)
+        dec = self._decode_fn(self.model, batch, x_1["bb_ca"],
+                              x_1["local_latents"], batch.aa_pred)
         return RFD4Result(x={}, x_1=x_1, data=batch, dec=dec)
 
     # ------------------------------------------------------------- search
@@ -595,39 +600,26 @@ class RFD4Search(eqx.Module):
             emit_masks = compute_flow_emit_masks(beam_data)
 
             if is_checkpoint:
-                # ---- branch: n_branch children per (input, beam slot);
-                # pool order: index p = branch_i * W + replica_r
-                children_x, children_x1, children_batch = [], [], []
-                for r in range(widths):
-                    replica_x = {dm: v[r * b:(r + 1) * b] for dm, v in x.items()}
-                    for _br in range(n_branch):
-                        k_branch, key = jax.random.split(key)
-                        cx, cx1, cbatch = self._partial_sim(
-                            _take_batch(beam_data, r * b, (r + 1) * b),
-                            replica_x, emit_masks=emit_masks, ts=ts, gts=gts,
-                            start=cursor, end=seg_end, depths=depths,
-                            key=k_branch)
-                        children_x.append(cx)
-                        children_x1.append(cx1)
-                        children_batch.append(cbatch)
-                pool_x = {dm: jnp.concatenate([c[dm] for c in children_x], axis=0)
-                          for dm in x}
-                pool_x1 = {dm: jnp.concatenate([c[dm] for c in children_x1], axis=0)
-                           for dm in x}
-                pool_batch = jax.tree.map(
-                    lambda *ls: (ls[0] if getattr(ls[0], "ndim", 1) == 0
-                                 else jnp.concatenate(ls, axis=0)), *children_batch)
+                # ---- branch: n_branch children per (input, beam slot) in one
+                # batched rollout; pool order: row = (branch_i * W + replica_r) * b + inp
+                k_branch, key = jax.random.split(key)
+                tiled_batch = _tile_beam(beam_data, n_branch, b * widths)
+                tiled_x = _tile_beam(x, n_branch, b * widths)
+                pool_x, pool_x1, pool_batch = self._partial_sim(
+                    tiled_batch, tiled_x, emit_masks=emit_masks, ts=ts, gts=gts,
+                    start=cursor, end=seg_end, depths=depths, key=k_branch)
 
                 # ---- score: rollout to t=1 + decode (default), or the
                 # children's own clean predictions (use_clean_prediction)
                 if ckpt.use_clean_prediction:
                     results = self._decode(pool_batch, pool_x1)
                 else:
-                    roll_x, roll_x1, _rb = self._partial_sim(
+                    k_roll, key = jax.random.split(key)
+                    roll_x, roll_x1, roll_batch = self._partial_sim(
                         pool_batch, pool_x, emit_masks=emit_masks, ts=ts,
                         gts=gts, start=seg_end, end=nsteps, depths=depths,
-                        key=key)
-                    results = self._decode(pool_batch, roll_x1)
+                        key=k_roll)
+                    results = self._decode(roll_batch, roll_x1)
 
                 # ---- evaluate the candidate pool (unbatched evaluate, per
                 # example, stacked — or the user's batch_evaluate wrapper)
@@ -688,31 +680,14 @@ class RFD4Search(eqx.Module):
                 # ---- prune the beam to the selected children, preserving the
                 # [replica-major] layout: slot (inp, w) -> pool candidate
                 # sel_children[inp, w] * b + inp
-                pool_np = {dm: np.asarray(pool_x[dm]) for dm in x}
-                new_x = {dm: np.zeros((b * widths,) + pool_np[dm].shape[1:],
-                                      dtype=pool_np[dm].dtype) for dm in x}
-                for inp in range(b):
-                    for w_i in range(widths):
-                        src = int(sel_children[inp, w_i]) * b + inp
-                        dst = w_i * b + inp
-                        for dm in x:
-                            new_x[dm][dst] = pool_np[dm][src]
-                x = {dm: jnp.asarray(new_x[dm]) for dm in x}
+                src_idx = jnp.asarray(
+                    (sel_children.T * b + np.arange(b)[None, :]).reshape(-1))
+                x = {dm: pool_x[dm][src_idx] for dm in x}
+                beam_data = _take_batch(pool_batch, 0, b * widths, indices=src_idx)
                 if seg_end == nsteps:
                     # survivors of an end-of-schedule checkpoint ARE the
                     # finals: keep their clean predictions for the decode
-                    pool_x1_np = {dm: np.asarray(pool_x1[dm]) for dm in pool_x1}
-                    sel_x1_fin = {dm: np.zeros((b * widths,)
-                                               + pool_x1_np[dm].shape[1:],
-                                               dtype=pool_x1_np[dm].dtype)
-                                  for dm in pool_x1_np}
-                    for inp in range(b):
-                        for w_i in range(widths):
-                            src = int(sel_children[inp, w_i]) * b + inp
-                            dst = w_i * b + inp
-                            for dm in sel_x1_fin:
-                                sel_x1_fin[dm][dst] = pool_x1_np[dm][src]
-                    sel_x1_fin = {dm: jnp.asarray(v) for dm, v in sel_x1_fin.items()}
+                    sel_x1_fin = {dm: pool_x1[dm][src_idx] for dm in pool_x1}
                 if save_states_dir is not None and seg_end < nsteps:
                     _save_state(save_states_dir, x, seg_end, widths, n_branch,
                                 nsteps, b)

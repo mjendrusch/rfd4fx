@@ -112,7 +112,7 @@ result.save_pdb("design.pdb")
 
 ## Documentation
 
-- [`docs/from_chains.md`](docs/from_chains.md) — complete `from_chains` dictionary-format reference.
+- [`docs/from_chains.md`](docs/from_chains.md) — `from_chains` usage guide: modes of use with examples, chain-dictionary types, and selection syntax.
 - [`docs/examples_binder.md`](docs/examples_binder.md) — binder design recipes (hotspots, interface motifs, partially-indexed motifs).
 - [`docs/examples_theozyme.md`](docs/examples_theozyme.md) — theozyme/motif scaffolding with ligand autofeaturization.
 - [`docs/examples_secondary_structure.md`](docs/examples_secondary_structure.md) — secondary-structure-conditioned generation.

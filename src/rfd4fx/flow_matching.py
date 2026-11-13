@@ -34,9 +34,11 @@ class MatcherConfig(eqx.Module):
     def _apply_stochastic_offset(self, x, emit_mask, offset_mask, group_ids, key):
         if offset_mask is None:
             return x
+        zero = jnp.zeros((), dtype=x.dtype)
         if group_ids is None:
             noise = jax.random.normal(key, x.shape[:-2] + x.shape[-1:])
-            x = x + self.stochastic_centering_scale * noise[..., None, :] * offset_mask[..., None].astype(x.dtype)
+            delta = jnp.where(offset_mask[..., None], self.stochastic_centering_scale * noise[..., None, :], zero)
+            x = x + delta
         else:
             # Per-group offsets without torch.unique: a static noise table indexed
             # by the (small-int) group id gives every group its own independent
@@ -44,9 +46,10 @@ class MatcherConfig(eqx.Module):
             # distribution as torch's per-unique-group loop, no dynamic shapes.
             g = jnp.clip(group_ids.astype(jnp.int32), 0, self.max_groups - 1)
             table = jax.random.normal(key, (self.max_groups, x.shape[-1]))
-            x = x + self.stochastic_centering_scale * table[g] * offset_mask[..., None].astype(x.dtype)
+            delta = jnp.where(offset_mask[..., None], self.stochastic_centering_scale * table[g], zero)
+            x = x + delta
         if emit_mask is not None:
-            x = x * emit_mask[..., None]
+            x = _mask(x, emit_mask)
         return x
 
     def _offset_mask(self, emit_mask, coord_cond_mask):
@@ -76,18 +79,20 @@ class StepParams(eqx.Module):
 
 
 def _mask(x, emit_mask):
-    return x * emit_mask[..., None]
+    return jnp.where(emit_mask[..., None], x, jnp.zeros((), dtype=x.dtype))
 
 
 def force_zero_com(x: Float[Array, "* n d"], emit_mask=None) -> Float[Array, "* n d"]:
     """Center over the token axis (utils/align.mean_w_mask semantics when masked)."""
     if emit_mask is None:
         return x - jnp.mean(x, axis=-2, keepdims=True)
-    m = emit_mask[..., None].astype(x.dtype)
-    n = jnp.clip(m.sum(axis=-2, keepdims=True), min=1.0)
-    mean = (x * m).sum(axis=-2, keepdims=True) / n
-    mean = jnp.where(n == 0, 0.0, mean)
-    return (x - mean) * m
+    mask_e = emit_mask[..., None]
+    zero = jnp.zeros((), dtype=x.dtype)
+    x_masked = jnp.where(mask_e, x, zero)
+    count = mask_e.sum(axis=-2, keepdims=True).astype(x.dtype)
+    safe_count = jnp.maximum(count, 1.0)
+    mean = jnp.where(count > 0, x_masked.sum(axis=-2, keepdims=True) / safe_count, zero)
+    return jnp.where(mask_e, x - mean, zero)
 
 
 # --- interpolation / conversions ------------------------------------------------
@@ -141,20 +146,28 @@ def predict_x1_from_v(x_t, v, t):
 
 
 def vf_to_score(x_t, v, t):
-    """score = (t * v - x_t) / (1 - t); requires t < 1 (host-side assert)."""
-    t = t[..., None, None]
-    return (t * v - x_t) / (1.0 - t)
+    """score = (t * v - x_t) / (1 - t); boundary-safe at t = 1."""
+    t = jnp.asarray(t, dtype=x_t.dtype)[..., None, None]
+    at_one = t >= 1.0
+    safe_denom = jnp.where(at_one, 1.0, 1.0 - t)
+    return jnp.where(at_one, jnp.zeros_like(x_t), (t * v - x_t) / safe_denom)
 
 
 def score_to_vf(x_t, score, t):
-    """v = (x_t + (1 - t) * score) / t; requires t > 0 (host-side assert)."""
-    t = t[..., None, None]
-    return (x_t + (1.0 - t) * score) / t
+    """v = (x_t + (1 - t) * score) / t; boundary-safe at t = 0."""
+    t = jnp.asarray(t, dtype=x_t.dtype)[..., None, None]
+    at_zero = t <= 0.0
+    safe_t = jnp.where(at_zero, 1.0, t)
+    return jnp.where(at_zero, jnp.zeros_like(x_t), (x_t + (1.0 - t) * score) / safe_t)
 
 
 def compute_tsr_ratio(t, tsr_k: float, tsr_sigma: float):
-    snr = t**2 / (1 - t) ** 2
-    return (snr * tsr_sigma**2 + 1) / (snr * tsr_sigma**2 / tsr_k + 1)
+    t = jnp.asarray(t)
+    at_one = t >= 1.0
+    safe_one_minus_t = jnp.where(at_one, 1.0, 1.0 - t)
+    snr = t**2 / safe_one_minus_t**2
+    ratio = (snr * tsr_sigma**2 + 1) / (snr * tsr_sigma**2 / tsr_k + 1)
+    return jnp.where(at_one, jnp.asarray(tsr_k, dtype=ratio.dtype), ratio)
 
 
 def guided_velocity(v, v_ucond, guidance_w: float, guidance_enabled: bool):
@@ -178,42 +191,45 @@ def simulation_step(
     params: StepParams,
     key=None,
 ) -> Float[Array, "* n d"]:
-    """One Euler step of the ODE/SDE, all mode branches as jnp.where masks.
+    """One Euler step of the ODE/SDE.
 
-    torch branches on the scalar t (python if); under jit both branches of a
-    lax.cond would execute, so the three modes are expressed as masked sums —
-    exactly the pytorch-to-equinox skill's guidance for value-dependent logic.
+    ``params.sampling_mode`` is a static string on :class:`StepParams`, so we
+    dispatch in Python on the active mode while using ``jnp.where`` for
+    time-dependent ODE/SDE windowing inside each mode.
     """
     t_scalar = jnp.asarray(t).reshape(())
+    mode = params.sampling_mode
 
-    # --- vf branch: dx = v * dt
-    dx_vf = v * dt
-
-    # --- sc branch -----------------------------------------------------------
-    score = vf_to_score(x_t, v, t_scalar)
-    endpoint_score_scale = 1.5  # torch: low-temperature ODE endpoint near t=1
-    v_sc_scaled = score_to_vf(x_t, score * endpoint_score_scale, t_scalar)
-    dx_sc_ode = v_sc_scaled * dt
-    eps = jax.random.normal(key, x_t.shape) if key is not None else 0.0
-    std_eps = jnp.sqrt(2 * gt * params.sc_scale_noise * dt)
-    dx_sc_sde = (v + gt * score) * dt + std_eps * eps
-    use_ode_sc = (t_scalar > params.t_lim_ode)[..., None, None]
-    dx_sc = jnp.where(use_ode_sc, dx_sc_ode, dx_sc_sde)
-
-    # --- vf_tsr branch -------------------------------------------------------
-    tsr = compute_tsr_ratio(t_scalar, params.tsr_k, params.tsr_sigma)
-    scaled_score = score * tsr
-    v_tsr = score_to_vf(x_t, scaled_score, t_scalar)
-    dx_tsr_ode = v_tsr * dt
-    std_tsr = jnp.sqrt(jnp.asarray(2 * gt * params.sc_scale_noise * dt))
-    dx_tsr_sde = (v_tsr + gt * scaled_score) * dt + std_tsr * eps
-    # t == 0: zero update; t outside (below, lim): deterministic
-    at_zero = (t_scalar == 0.0)[..., None, None]
-    deterministic = ((t_scalar > params.t_lim_ode) | (t_scalar < params.t_lim_ode_below))[..., None, None]
-    dx_tsr = jnp.where(deterministic, dx_tsr_ode, dx_tsr_sde)
-    dx_tsr = jnp.where(at_zero, 0.0, dx_tsr)
-
-    dx = jnp.where(params.sampling_mode == "vf", dx_vf, jnp.where(params.sampling_mode == "sc", dx_sc, dx_tsr))
+    if mode == "vf":
+        dx = v * dt
+    elif mode == "sc":
+        score = vf_to_score(x_t, v, t_scalar)
+        endpoint_score_scale = 1.5  # torch: low-temperature ODE endpoint near t=1
+        v_sc_scaled = score_to_vf(x_t, score * endpoint_score_scale, t_scalar)
+        dx_sc_ode = v_sc_scaled * dt
+        eps = jax.random.normal(key, x_t.shape) if key is not None else 0.0
+        std_eps = jnp.sqrt(jnp.maximum(jnp.asarray(2 * gt * params.sc_scale_noise * dt), 0.0))
+        dx_sc_sde = (v + gt * score) * dt + std_eps * eps
+        at_zero = (t_scalar <= 0.0)[..., None, None]
+        use_ode_sc = (t_scalar > params.t_lim_ode)[..., None, None]
+        dx = jnp.where(use_ode_sc, dx_sc_ode, dx_sc_sde)
+        dx = jnp.where(at_zero, 0.0, dx)
+    elif mode == "vf_tsr":
+        score = vf_to_score(x_t, v, t_scalar)
+        tsr = compute_tsr_ratio(t_scalar, params.tsr_k, params.tsr_sigma)
+        scaled_score = score * tsr
+        v_tsr = score_to_vf(x_t, scaled_score, t_scalar)
+        dx_tsr_ode = v_tsr * dt
+        eps = jax.random.normal(key, x_t.shape) if key is not None else 0.0
+        std_tsr = jnp.sqrt(jnp.maximum(jnp.asarray(2 * gt * params.sc_scale_noise * dt), 0.0))
+        dx_tsr_sde = (v_tsr + gt * scaled_score) * dt + std_tsr * eps
+        # t == 0: zero update; t outside (below, lim): deterministic
+        at_zero = (t_scalar <= 0.0)[..., None, None]
+        deterministic = ((t_scalar > params.t_lim_ode) | (t_scalar < params.t_lim_ode_below))[..., None, None]
+        dx = jnp.where(deterministic, dx_tsr_ode, dx_tsr_sde)
+        dx = jnp.where(at_zero, 0.0, dx)
+    else:
+        raise ValueError(f"Unknown sampling_mode: {mode!r}")
 
     x_next = x_t + dx
     x_next = _mask(x_next, emit_mask)
@@ -271,9 +287,10 @@ def get_gt(t, mode: str, param: float, clamp_val: float | None = None, eps: floa
     if mode == "1-t/t":
         gt = (1.0 - t) / (t + eps)
     elif mode == "tan":
-        gt = (jnp.pi / 2.0) * jnp.sin((1.0 - t) * jnp.pi / 2.0) / (
-            jnp.cos((1.0 - t) * jnp.pi / 2.0) + eps
-        )
+        # sin((1 - t) * pi/2) / cos((1 - t) * pi/2) == cos(t * pi/2) / sin(t * pi/2);
+        # direct t * pi/2 avoids catastrophic 1 - t cancellation near t = 0.
+        half_pi = jnp.pi / 2.0
+        gt = half_pi * jnp.cos(t * half_pi) / (jnp.sin(t * half_pi) + eps)
     elif mode == "1/t":
         gt = 1.0 / (t + eps)
     else:
@@ -341,11 +358,15 @@ def full_simulation(
             g = g / compute_tsr_ratio(ts[dm][:-1], ssp.tsr_k, ssp.tsr_sigma) ** 2
         gts[dm] = g
 
+    bsz = batch.padding_mask.shape[0]
+    ts_np = {dm: np.asarray(v, dtype=np.float32) for dm, v in ts.items()}
+    gts_np = {dm: np.asarray(v, dtype=np.float32) for dm, v in gts.items()}
+
     k_init, key_state = jax.random.split(key)
     x = {
-        "bb_ca": sample_noise(k_init, (batch.padding_mask.shape[0],), n, matcher_cfgs["bb_ca"],
+        "bb_ca": sample_noise(k_init, (bsz,), n, matcher_cfgs["bb_ca"],
                               emit_masks["bb_ca"], coord_cond_mask=coord_cond_mask, group_ids=group_ids),
-        "local_latents": sample_noise(k_init, (batch.padding_mask.shape[0],), n, matcher_cfgs["local_latents"],
+        "local_latents": sample_noise(k_init, (bsz,), n, matcher_cfgs["local_latents"],
                                       emit_masks["local_latents"], coord_cond_mask=coord_cond_mask,
                                       group_ids=group_ids),
     }
@@ -355,10 +376,12 @@ def full_simulation(
     x_1_pred, final_logits = None, {}
     for step in range(nsteps):
         k_model, k_bb, k_lat, key_state = jax.random.split(key_state, 4)
-        t_bb = ts["bb_ca"][step] * jnp.ones(batch.padding_mask.shape[0])
-        t_lat = ts["local_latents"][step] * jnp.ones(batch.padding_mask.shape[0])
-        dt = {"bb_ca": float(ts["bb_ca"][step + 1] - ts["bb_ca"][step]),
-              "local_latents": float(ts["local_latents"][step + 1] - ts["local_latents"][step])}
+        t_bb_s = jnp.asarray(ts_np["bb_ca"][step], dtype=jnp.float32)
+        t_lat_s = jnp.asarray(ts_np["local_latents"][step], dtype=jnp.float32)
+        t_bb = jnp.full((bsz,), ts_np["bb_ca"][step], dtype=jnp.float32)
+        t_lat = jnp.full((bsz,), ts_np["local_latents"][step], dtype=jnp.float32)
+        dt = {"bb_ca": float(ts_np["bb_ca"][step + 1] - ts_np["bb_ca"][step]),
+              "local_latents": float(ts_np["local_latents"][step + 1] - ts_np["local_latents"][step])}
 
         batch = _set_x_t(batch, x["bb_ca"], x["local_latents"], t_bb, t_lat)
         # traced depth: a dynamic fori_loop trip count -> one compile serves all depths
@@ -376,14 +399,15 @@ def full_simulation(
         else:
             v = {dm: guided_velocity(v[dm], None, 1.0, False) for dm in v}
 
-        x_1_pred = {dm: _mask(predict_x1_from_v(x[dm], v[dm], ts[dm][step]), emit_masks[dm]) for dm in x}
+        t_step = {"bb_ca": t_bb_s, "local_latents": t_lat_s}
+        x_1_pred = {dm: _mask(predict_x1_from_v(x[dm], v[dm], t_step[dm]), emit_masks[dm]) for dm in x}
 
         # fresh keys per step (split once, one per modality)
         k_bb, k_lat, key_state = jax.random.split(key_state, 3)
-        x["bb_ca"] = simulation_step(x["bb_ca"], v["bb_ca"], ts["bb_ca"][step], dt["bb_ca"],
-                                     float(gts["bb_ca"][step]), emit_masks["bb_ca"], step_params["bb_ca"], key=k_bb)
-        x["local_latents"] = simulation_step(x["local_latents"], v["local_latents"], ts["local_latents"][step],
-                                             dt["local_latents"], float(gts["local_latents"][step]),
+        x["bb_ca"] = simulation_step(x["bb_ca"], v["bb_ca"], t_bb_s, dt["bb_ca"],
+                                     float(gts_np["bb_ca"][step]), emit_masks["bb_ca"], step_params["bb_ca"], key=k_bb)
+        x["local_latents"] = simulation_step(x["local_latents"], v["local_latents"], t_lat_s,
+                                             dt["local_latents"], float(gts_np["local_latents"][step]),
                                              emit_masks["local_latents"], step_params["local_latents"], key=k_lat)
         if guidance_model is not None:
             delta = guidance_model(x_1_pred=x_1_pred)
@@ -629,6 +653,10 @@ def _chain_letters(data_i) -> np.ndarray:
     return letters
 
 
+def _decode_predictions(model, data: FlowBatch, x_bb, x_lat, aa_pred):
+    return model.decode(data, x_bb, x_lat, aa_pred=aa_pred)
+
+
 class RFD4Sampler:
     """Flow sampler driving a jitted step callable (``RFD4.step()``).
 
@@ -654,6 +682,7 @@ class RFD4Sampler:
         self.sampler_args = sampler_args
         self.guidance_w = guidance_w
         self._step = eqx.filter_jit(step) if jit_step else step
+        self._decode = eqx.filter_jit(_decode_predictions)
 
     def sample(self, data: FlowBatch, key, *, nsteps: int = 60,
                recycle_schedule: tuple[tuple[int, int], ...] = THINKING_HIGH,
@@ -704,12 +733,15 @@ class RFD4Sampler:
                 g = g / compute_tsr_ratio(ts[dm][:-1], ssp.tsr_k, ssp.tsr_sigma) ** 2
             gts[dm] = g
 
-        n = data.padding_mask.shape[-1]
+        bsz, n = data.padding_mask.shape
+        ts_np = {dm: np.asarray(v, dtype=np.float32) for dm, v in ts.items()}
+        gts_np = {dm: np.asarray(v, dtype=np.float32) for dm, v in gts.items()}
+
         k_init, key_state = jax.random.split(key)
         x = {
-            "bb_ca": sample_noise(k_init, (data.padding_mask.shape[0],), n,
+            "bb_ca": sample_noise(k_init, (bsz,), n,
                                   self.matcher_cfgs["bb_ca"], emit_masks["bb_ca"]),
-            "local_latents": sample_noise(k_init, (data.padding_mask.shape[0],), n,
+            "local_latents": sample_noise(k_init, (bsz,), n,
                                           self.matcher_cfgs["local_latents"],
                                           emit_masks["local_latents"]),
         }
@@ -718,8 +750,10 @@ class RFD4Sampler:
                                       is_leaf=lambda l: l is None)
         for i in range(nsteps):
             k_model, _, _, key_state = jax.random.split(key_state, 4)
-            t_bb = ts["bb_ca"][i] * jnp.ones(data.padding_mask.shape[0])
-            t_lat = ts["local_latents"][i] * jnp.ones(data.padding_mask.shape[0])
+            t_bb_s = jnp.asarray(ts_np["bb_ca"][i], dtype=jnp.float32)
+            t_lat_s = jnp.asarray(ts_np["local_latents"][i], dtype=jnp.float32)
+            t_bb = jnp.full((bsz,), ts_np["bb_ca"][i], dtype=jnp.float32)
+            t_lat = jnp.full((bsz,), ts_np["local_latents"][i], dtype=jnp.float32)
             data = _set_x_t(data, x["bb_ca"], x["local_latents"], t_bb, t_lat)
             data = eqx.tree_at(lambda d: d.n_recycle, data,
                                jnp.asarray(recycle_schedule[i], dtype=jnp.int32),
@@ -741,24 +775,23 @@ class RFD4Sampler:
             # fresh keys per step (split once, one per modality) — same key
             # discipline as full_simulation
             k_bb, k_lat, key_state = jax.random.split(key_state, 3)
-            x["bb_ca"] = simulation_step(x["bb_ca"], v["bb_ca"], ts["bb_ca"][i],
-                                         float(ts["bb_ca"][i + 1] - ts["bb_ca"][i]),
-                                         float(gts["bb_ca"][i]), emit_masks["bb_ca"],
+            x["bb_ca"] = simulation_step(x["bb_ca"], v["bb_ca"], t_bb_s,
+                                         float(ts_np["bb_ca"][i + 1] - ts_np["bb_ca"][i]),
+                                         float(gts_np["bb_ca"][i]), emit_masks["bb_ca"],
                                          self.step_params["bb_ca"], key=k_bb)
             x["local_latents"] = simulation_step(
-                x["local_latents"], v["local_latents"], ts["local_latents"][i],
-                float(ts["local_latents"][i + 1] - ts["local_latents"][i]),
-                float(gts["local_latents"][i]), emit_masks["local_latents"],
+                x["local_latents"], v["local_latents"], t_lat_s,
+                float(ts_np["local_latents"][i + 1] - ts_np["local_latents"][i]),
+                float(gts_np["local_latents"][i]), emit_masks["local_latents"],
                 self.step_params["local_latents"], key=k_lat)
 
         dec = None
         if decode:
-            decode_fn = (eqx.filter_jit(lambda m, d: m.decode(
-                d, x_1["bb_ca"], x_1["local_latents"], aa_pred=data.aa_pred))
-                if jit_decode else
-                lambda m, d: m.decode(d, x_1["bb_ca"], x_1["local_latents"],
-                                      aa_pred=data.aa_pred))
-            dec = decode_fn(self.model, data)
+            dec = (self._decode(self.model, data, x_1["bb_ca"],
+                                x_1["local_latents"], data.aa_pred)
+                   if jit_decode else
+                   _decode_predictions(self.model, data, x_1["bb_ca"],
+                                       x_1["local_latents"], data.aa_pred))
         return RFD4Result(x=x, x_1=x_1, data=data, dec=dec)
 
 

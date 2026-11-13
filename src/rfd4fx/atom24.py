@@ -98,6 +98,23 @@ def residue_atom24_plan(res_name: str, vocab_index: int):
     return plan, elems
 
 
+@functools.lru_cache(maxsize=1)
+def _vocab_atom24_tables():
+    """Precompute (V+1, 24) slot-plan and atomic-number tables across the vocabulary."""
+    from atomworks.ml.encoding_definitions import UNIFIED_ATOM37_ENCODING as enc
+
+    idx_to_tok = (enc.idx_to_token if isinstance(enc.idx_to_token, dict)
+                  else dict(enumerate(enc.idx_to_token)))
+    v_size = max(idx_to_tok) + 1 if idx_to_tok else 0
+    plans = np.full((v_size + 1, ATOM24), -1, dtype=np.int32)
+    elems = np.zeros((v_size + 1, ATOM24), dtype=np.int32)
+    for idx, tok in idx_to_tok.items():
+        p, e = residue_atom24_plan(str(tok), int(idx))
+        plans[idx] = p
+        elems[idx] = e
+    return plans, elems
+
+
 @functools.lru_cache(maxsize=None)
 def _ccd_element_of(res_name: str, atom_name: str) -> str:
     try:
@@ -184,10 +201,6 @@ def to_atom24(dec, batch, aa_pred=None) -> Atom24:
     atoms (no layout slot, not predicted present, non-finite or degenerate
     coordinates) are 0.0 / False.
     """
-    from atomworks.ml.encoding_definitions import UNIFIED_ATOM37_ENCODING as enc
-
-    idx_to_tok = (enc.idx_to_token if isinstance(enc.idx_to_token, dict)
-                  else dict(enumerate(enc.idx_to_token)))
     coors = np.asarray(dec.coors_nm)[0] * 10.0                 # nm -> Å
     emit = np.asarray(dec.emit_mask)[0]
     gate = np.asarray(dec.atom_mask)[0] & emit[:, None]
@@ -199,23 +212,23 @@ def to_atom24(dec, batch, aa_pred=None) -> Atom24:
     is_polymer = real & emit & np.isin(tt, _POLYMER_TOKEN_TYPES)
     res_tokens = np.flatnonzero(is_polymer)
 
-    coords = np.zeros((len(res_tokens), ATOM24, 3), np.float32)
-    mask = np.zeros((len(res_tokens), ATOM24), bool)
-    restype = np.zeros(len(res_tokens), np.int32)
-    elements = np.zeros((len(res_tokens), ATOM24), np.int32)
-    for r, t in enumerate(res_tokens):
-        v = int(src[t])
-        restype[r] = v
-        res_name = str(idx_to_tok.get(v, ""))
-        plan, elems = residue_atom24_plan(res_name, v)
-        elements[r] = elems
-        for s24, s37 in enumerate(plan):
-            if s37 < 0:
-                continue
-            xyz = coors[t, s37]
-            if gate[t, s37] and np.isfinite(xyz).all() and np.abs(xyz).sum() > 0:
-                coords[r, s24] = xyz
-                mask[r, s24] = True
+    plans_tbl, elems_tbl = _vocab_atom24_tables()
+    sentinel = plans_tbl.shape[0] - 1
+    restype = src[res_tokens].astype(np.int32)
+    v_safe = np.where((restype >= 0) & (restype < sentinel), restype, sentinel)
+    plan = plans_tbl[v_safe]
+    elements = elems_tbl[v_safe].copy()
+
+    s37 = np.maximum(plan, 0)
+    t_idx = res_tokens[:, None]
+    xyz = coors[t_idx, s37]
+    mask = (
+        (plan >= 0)
+        & gate[t_idx, s37]
+        & np.isfinite(xyz).all(axis=-1)
+        & (np.abs(xyz).sum(axis=-1) > 0)
+    )
+    coords = np.where(mask[..., None], xyz, 0.0).astype(np.float32)
     return Atom24(coords=coords, mask=mask, restype=restype, elements=elements)
 
 
